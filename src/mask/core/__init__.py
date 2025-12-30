@@ -26,6 +26,7 @@ from mask.core.state import (
     SkillStateUpdate,
     skill_list_reducer,
 )
+from mask.core.registry import SkillRegistry
 
 __all__ = [
     # Exceptions
@@ -45,4 +46,6 @@ __all__ = [
     "SkillState",
     "SkillStateUpdate",
     "skill_list_reducer",
+    # Registry
+    "SkillRegistry",
 ]
