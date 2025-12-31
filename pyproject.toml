@@ -77,9 +77,9 @@ all = [
 mask = "mask.cli.main:app"
 
 [project.urls]
-Homepage = "https://github.com/your-org/mask-kernel"
-Documentation = "https://github.com/your-org/mask-kernel#readme"
-Repository = "https://github.com/your-org/mask-kernel"
+Homepage = "https://github.com/colinlee0924/mask-kernel"
+Documentation = "https://github.com/colinlee0924/mask-kernel#readme"
+Repository = "https://github.com/colinlee0924/mask-kernel"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mask"]
