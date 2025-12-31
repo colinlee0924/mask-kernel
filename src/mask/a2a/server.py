@@ -55,6 +55,8 @@ class MaskA2AServer:
         skills: Optional[List[AgentSkill]] = None,
         capabilities: Optional[AgentCapabilities] = None,
         stream: bool = False,
+        default_input_modes: Optional[List[str]] = None,
+        default_output_modes: Optional[List[str]] = None,
     ) -> None:
         """Initialize A2A Server.
 
@@ -67,6 +69,8 @@ class MaskA2AServer:
             skills: List of AgentSkill describing agent capabilities.
             capabilities: Agent capabilities configuration.
             stream: Whether to enable streaming responses.
+            default_input_modes: Supported input modes (default: ["text"]).
+            default_output_modes: Supported output modes (default: ["text"]).
         """
         self.agent = agent
         self.name = name
@@ -76,6 +80,8 @@ class MaskA2AServer:
         self.skills = skills or []
         self.capabilities = capabilities or AgentCapabilities(streaming=stream)
         self.stream = stream
+        self.default_input_modes = default_input_modes or ["text"]
+        self.default_output_modes = default_output_modes or ["text"]
         self._app: Optional[A2AStarletteApplication] = None
 
     def create_agent_card(self, host: str, port: int) -> AgentCard:
@@ -96,6 +102,8 @@ class MaskA2AServer:
             version=self.version,
             skills=self.skills,
             capabilities=self.capabilities,
+            defaultInputModes=self.default_input_modes,
+            defaultOutputModes=self.default_output_modes,
         )
 
     def create_app(self, host: str, port: int) -> A2AStarletteApplication:
