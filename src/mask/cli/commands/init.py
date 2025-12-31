@@ -5,12 +5,9 @@ Usage:
     mask init my-agent --no-stateless
 """
 
-import os
 from pathlib import Path
-from typing import Optional
 
 import typer
-from jinja2 import Environment, PackageLoader
 
 # Skills README content
 SKILLS_README = """# Skills Directory
@@ -153,9 +150,8 @@ def init_command(
 
 def _write_pyproject_toml(project_dir: Path, context: dict) -> None:
     """Write pyproject.toml."""
-    deps = ['mask-kernel>=0.1.0']
-    if context["with_mcp"]:
-        deps.append('mask-kernel[mcp]>=0.1.0')
+    # Use GitHub URL since mask-kernel is not on PyPI yet
+    mask_kernel_dep = "mask-kernel @ git+https://github.com/colinlee0924/mask-kernel.git"
 
     content = f'''[build-system]
 requires = ["hatchling"]
@@ -169,7 +165,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 
 dependencies = [
-    "mask-kernel>=0.1.0",
+    "{mask_kernel_dep}",
 ]
 
 [project.optional-dependencies]
@@ -177,6 +173,9 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24.0",
 ]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/{context["module_name"]}"]
