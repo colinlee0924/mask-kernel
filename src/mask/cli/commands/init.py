@@ -95,11 +95,22 @@ def init_command(
 
     Creates a new directory with the project structure and configuration.
     """
+    # Handle path input: extract just the final component as project name
+    # e.g., "../uat/my-agent" -> project_name = "my-agent", project_dir = "../uat/my-agent"
+    project_path = Path(project_name)
+    actual_project_name = project_path.name  # Get just the last component
+
     # Normalize project name
-    project_name_normalized = project_name.lower().replace("_", "-")
+    project_name_normalized = actual_project_name.lower().replace("_", "-")
     module_name = project_name_normalized.replace("-", "_")
 
-    project_dir = output_dir / project_name_normalized
+    # Determine project directory
+    if len(project_path.parts) > 1:
+        # User provided a path, use it directly
+        project_dir = project_path
+    else:
+        # User provided just a name, put it in output_dir
+        project_dir = output_dir / project_name_normalized
 
     if project_dir.exists():
         typer.echo(f"Error: Directory '{project_dir}' already exists", err=True)
@@ -226,6 +237,11 @@ ANTHROPIC_API_KEY=your-anthropic-key
 
 # MASK Configuration
 MASK_LLM_PROVIDER=anthropic
+
+# Langfuse Observability (optional)
+LANGFUSE_SECRET_KEY=your-langfuse-project-secret-key
+LANGFUSE_PUBLIC_KEY=your-langfuse-project-public-key
+LANGFUSE_BASE_URL=http://localhost:3001
 
 # Phoenix Observability (optional)
 # PHOENIX_COLLECTOR_ENDPOINT=http://localhost:6006
