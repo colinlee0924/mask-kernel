@@ -46,8 +46,13 @@ dependencies = [
 redis = ["redis>=5.0"]
 postgresql = ["asyncpg>=0.29.0", "sqlalchemy>=2.0"]
 
-# Observability
+# Observability - Langfuse (recommended for multi-tenant production)
 observability = [
+    "langfuse>=2.0.0",
+]
+
+# Observability - Phoenix (simpler setup, good for development)
+phoenix = [
     "arize-phoenix>=4.0",
     "openinference-instrumentation-langchain>=0.1.0",
 ]
