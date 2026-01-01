@@ -48,10 +48,10 @@ async def load_mcp_tools_from_config(
         logger.debug("No MCP servers to load")
         return []
 
-    async with client:
-        tools = await client.get_tools()
-        logger.info("Loaded %d MCP tools", len(tools))
-        return tools
+    # Load tools directly (langchain-mcp-adapters 0.1.0+ doesn't need context manager)
+    tools = await client.get_tools()
+    logger.info("Loaded %d MCP tools", len(tools))
+    return tools
 
 
 async def load_mcp_tools_for_agent(
