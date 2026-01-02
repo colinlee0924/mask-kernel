@@ -8,12 +8,13 @@ Key features:
 - Stateless by default (stateless=True)
 - Optional session persistence for stateful operation
 - Integration with SkillRegistry for Progressive Disclosure
-- LangGraph-based execution
+- LangGraph-based execution with create_react_agent
+- Built-in observability via Langfuse callbacks with proper trace hierarchy
 """
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, AsyncIterator, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, Optional, Sequence
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
@@ -25,6 +26,9 @@ from mask.middleware.skill_middleware import SkillMiddleware
 from mask.session.session import Session
 from mask.storage.base import SessionStore
 from mask.storage.memory_store import MemorySessionStore
+
+if TYPE_CHECKING:
+    from langchain_core.callbacks.base import BaseCallbackHandler
 
 logger = logging.getLogger(__name__)
 
@@ -59,10 +63,12 @@ class BaseAgent(ABC):
         skill_registry: Optional[SkillRegistry] = None,
         system_prompt: str = "You are a helpful assistant.",
         *,
+        name: Optional[str] = None,
         stateless: bool = True,
         session_store: Optional[SessionStore] = None,
         additional_tools: Optional[List[BaseTool]] = None,
         middleware: Optional[SkillMiddleware] = None,
+        enable_observability: bool = True,
     ) -> None:
         """Initialize the base agent.
 
@@ -70,16 +76,20 @@ class BaseAgent(ABC):
             model: The LLM model to use.
             skill_registry: Optional skill registry for Progressive Disclosure.
             system_prompt: The system prompt for the agent.
+            name: Agent name for observability traces. If not provided, uses class name.
             stateless: If True (default), no session state is maintained.
             session_store: Storage backend for sessions. Required for stateful.
             additional_tools: Non-skill tools to always include.
             middleware: Custom skill middleware. Created automatically if not provided.
+            enable_observability: If True (default), auto-detect and use Langfuse tracing.
         """
         self.model = model
         self.skill_registry = skill_registry or SkillRegistry()
         self.system_prompt = system_prompt
+        self.name = name or self.__class__.__name__
         self.stateless = stateless
         self.additional_tools = additional_tools or []
+        self.enable_observability = enable_observability
 
         # Session store setup
         if not stateless:
@@ -91,10 +101,40 @@ class BaseAgent(ABC):
         self.middleware = middleware or SkillMiddleware(self.skill_registry)
 
         logger.debug(
-            "Initialized BaseAgent: stateless=%s, skills=%d",
+            "Initialized BaseAgent: name=%s, stateless=%s, skills=%d, observability=%s",
+            self.name,
             stateless,
             len(self.skill_registry),
+            enable_observability,
         )
+
+    def _get_callbacks(self, session_id: Optional[str] = None) -> List[Any]:
+        """Get callback handlers for model invocation.
+
+        Args:
+            session_id: Optional session ID for trace grouping.
+
+        Returns:
+            List of callback handlers (e.g., Langfuse handler).
+        """
+        if not self.enable_observability:
+            return []
+
+        callbacks: List[Any] = []
+        try:
+            from mask.observability import get_langfuse_handler
+
+            handler = get_langfuse_handler(
+                trace_name=self.name,
+                session_id=session_id,
+            )
+            if handler:
+                callbacks.append(handler)
+                logger.debug("Added Langfuse callback handler for agent=%s", self.name)
+        except ImportError:
+            pass
+
+        return callbacks
 
     @abstractmethod
     async def invoke(
@@ -202,19 +242,75 @@ class BaseAgent(ABC):
         return list(state.get("messages", []))
 
 
-class SimpleAgent(BaseAgent):
-    """Simple agent implementation using direct model calls.
+def _default_agent_factory(model, tools, system_prompt):
+    """Default agent factory using LangChain v1.x create_agent.
 
-    This is a basic implementation suitable for simple use cases.
-    For more complex scenarios, use LangGraph-based agents.
+    Args:
+        model: The LLM model.
+        tools: List of tools for the agent.
+        system_prompt: System prompt for the agent.
+
+    Returns:
+        Agent instance (LangGraph-based).
+    """
+    from langchain.agents import create_agent
+
+    return create_agent(model, tools=tools, system_prompt=system_prompt)
+
+
+class SimpleAgent(BaseAgent):
+    """Simple agent implementation with pluggable agent factory.
+
+    By default uses LangChain v1.x create_agent. You can pass a custom
+    agent_factory to use different agent implementations (e.g., deepagents).
+
+    Observability (Phoenix/Langfuse) is handled uniformly by mask-kernel.
+    Developers only need to configure .env (project, api-key, baseurl).
 
     Example:
+        # Default: LangChain create_agent
         agent = SimpleAgent(
             model=factory.get_model(tier=ModelTier.THINKING),
+            name="my-agent",
             system_prompt="You are a helpful assistant.",
         )
-        response = await agent.invoke("Hello!")
+
+        # Custom: Using deepagents
+        from deepagents import create_deep_agent
+        agent = SimpleAgent(
+            model=factory.get_model(tier=ModelTier.THINKING),
+            agent_factory=create_deep_agent,
+            ...
+        )
     """
+
+    def __init__(
+        self,
+        *args: Any,
+        agent_factory: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Initialize the SimpleAgent.
+
+        Args:
+            agent_factory: Custom agent factory function. Signature:
+                (model, tools, system_prompt) -> Agent
+                Defaults to LangChain v1.x create_agent.
+        """
+        super().__init__(*args, **kwargs)
+        self._graph = None  # Lazy-initialized agent
+        self.agent_factory = agent_factory or _default_agent_factory
+
+    def _get_graph(self, tools: List[BaseTool]) -> Any:
+        """Create agent using the configured factory.
+
+        Args:
+            tools: List of tools for the agent.
+
+        Returns:
+            Agent instance.
+        """
+        return self.agent_factory(self.model, tools, self.system_prompt)
 
     async def invoke(
         self,
@@ -243,19 +339,35 @@ class SimpleAgent(BaseAgent):
         skills_loaded = session.skills_loaded if session else []
         state = self._build_state(messages, skills_loaded)
 
-        # Get tools and prepare messages
+        # Get tools
         tools = self._get_tools(state)
-        prepared_messages = self._prepare_messages(state)
 
-        # Invoke model
-        if tools:
-            model_with_tools = self.model.bind_tools(tools)
-            response = await model_with_tools.ainvoke(prepared_messages)
+        # Get callbacks for observability with session_id
+        callbacks = self._get_callbacks(session_id=session_id)
+        config: Dict[str, Any] = {
+            "callbacks": callbacks,
+            "run_name": self.name,  # Set trace name for observability
+        }
+
+        # Add session/thread configuration for LangGraph
+        if session_id:
+            config["configurable"] = {"thread_id": session_id}
+
+        # Always use LangGraph agent (create_agent) for proper trace structure
+        # Even with empty tools, this ensures Phoenix/Langfuse see full execution details:
+        # LangGraph → model → ChatAnthropic (like basic-observability-examples)
+        graph = self._get_graph(tools)  # tools can be empty list
+        result = await graph.ainvoke(
+            {"messages": messages},
+            config=config,
+        )
+        # Extract last message from result
+        result_messages = result.get("messages", [])
+        if result_messages:
+            last_message = result_messages[-1]
+            response_content = self._extract_content(last_message)
         else:
-            response = await self.model.ainvoke(prepared_messages)
-
-        # Extract response content
-        response_content = self._extract_content(response)
+            response_content = ""
 
         # Update session
         if session:
@@ -292,23 +404,37 @@ class SimpleAgent(BaseAgent):
         skills_loaded = session.skills_loaded if session else []
         state = self._build_state(messages, skills_loaded)
 
-        # Get tools and prepare messages
+        # Get tools
         tools = self._get_tools(state)
-        prepared_messages = self._prepare_messages(state)
 
-        # Stream from model
+        # Get callbacks for observability with session_id
+        callbacks = self._get_callbacks(session_id=session_id)
+        config: Dict[str, Any] = {
+            "callbacks": callbacks,
+            "run_name": self.name,  # Set trace name for observability
+        }
+
+        # Add session/thread configuration for LangGraph
+        if session_id:
+            config["configurable"] = {"thread_id": session_id}
+
+        # Always use LangGraph agent (create_agent) for proper trace structure
         full_response = ""
-        if tools:
-            model_with_tools = self.model.bind_tools(tools)
-            async for chunk in model_with_tools.astream(prepared_messages):
-                if hasattr(chunk, "content") and chunk.content:
-                    full_response += chunk.content
-                    yield chunk.content
-        else:
-            async for chunk in self.model.astream(prepared_messages):
-                if hasattr(chunk, "content") and chunk.content:
-                    full_response += chunk.content
-                    yield chunk.content
+        graph = self._get_graph(tools)  # tools can be empty list
+
+        async for event in graph.astream(
+            {"messages": messages},
+            config=config,
+            stream_mode="messages",
+        ):
+            # Extract content from streaming events
+            if isinstance(event, tuple) and len(event) == 2:
+                msg, metadata = event
+                if hasattr(msg, "content") and msg.content:
+                    content = msg.content
+                    if isinstance(content, str):
+                        full_response += content
+                        yield content
 
         # Update session
         if session:
