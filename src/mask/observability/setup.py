@@ -261,9 +261,10 @@ def shutdown_langfuse() -> None:
 
 
 class FilteringSpanProcessor:
-    """過濾特定 instrumentation scopes 的 spans，減少觀測雜訊。
+    """過濾特定 spans，減少觀測雜訊。
 
     用於過濾 A2A SDK 等基礎設施層級的 traces，讓開發者專注於業務邏輯。
+    支援按 instrumentation scope 名稱或 span 名稱前綴過濾。
 
     Example:
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -273,40 +274,55 @@ class FilteringSpanProcessor:
         base_processor = BatchSpanProcessor(exporter)
         filtering_processor = FilteringSpanProcessor(
             delegate_processor=base_processor,
-            excluded_scopes=['a2a-python-sdk', 'opentelemetry']
+            excluded_scopes=['a2a-python-sdk'],
+            excluded_span_prefixes=['a2a.server.', 'a2a.client.']
         )
     """
 
-    def __init__(self, delegate_processor, excluded_scopes=None):
+    def __init__(
+        self,
+        delegate_processor,
+        excluded_scopes=None,
+        excluded_span_prefixes=None,
+    ):
         """初始化過濾 processor。
 
         Args:
             delegate_processor: 下游 SpanProcessor（如 BatchSpanProcessor）
             excluded_scopes: 要過濾的 instrumentation scope 名稱列表
+            excluded_span_prefixes: 要過濾的 span 名稱前綴列表
         """
         self.delegate_processor = delegate_processor
-        self.excluded_scopes = excluded_scopes or ['a2a-python-sdk']
+        self.excluded_scopes = excluded_scopes or []
+        self.excluded_span_prefixes = excluded_span_prefixes or []
 
     def on_start(self, span, parent_context=None):
         """Span 開始時調用（不需要過濾）"""
         pass
 
     def on_end(self, span):
-        """Span 結束時調用，根據 scope 決定是否傳遞給下游。
+        """Span 結束時調用，根據條件決定是否傳遞給下游。
 
         Args:
-            span: ReadableSpan 對象，包含 instrumentation_scope 屬性
+            span: ReadableSpan 對象
         """
+        # 檢查 span 名稱前綴
+        span_name = span.name or ""
+        for prefix in self.excluded_span_prefixes:
+            if span_name.startswith(prefix):
+                logger.debug("Filtering span by name prefix: %s", span_name)
+                return  # 跳過這個 span
+
         # 檢查 instrumentation_scope
-        if span.instrumentation_scope:
+        if span.instrumentation_scope and self.excluded_scopes:
             scope_name = span.instrumentation_scope.name
             if scope_name in self.excluded_scopes:
                 logger.debug(
                     "Filtering span from scope: %s (name: %s)",
                     scope_name,
-                    span.name
+                    span_name
                 )
-                return  # 跳過這個 span，不傳給下游 processor
+                return  # 跳過這個 span
 
         # 將 span 傳給下游 processor
         self.delegate_processor.on_end(span)
@@ -324,7 +340,7 @@ def setup_openinference_tracing(
     project_name: str = "mask-agent",
     endpoint: Optional[str] = None,
     batch: bool = True,
-    excluded_scopes: Optional[list] = None,
+    filter_a2a_noise: bool = True,
 ) -> bool:
     """Set up OpenInference tracing with Arize Phoenix.
 
@@ -335,7 +351,8 @@ def setup_openinference_tracing(
         endpoint: Phoenix endpoint URL. If not provided, uses
             PHOENIX_COLLECTOR_ENDPOINT env var or defaults to local.
         batch: Whether to batch trace exports (recommended for production).
-        excluded_scopes: Currently ignored (simplified for stability).
+        filter_a2a_noise: If True (default), filter out A2A SDK infrastructure
+            spans to reduce noise and focus on agent execution.
 
     Returns:
         True if setup was successful, False otherwise.
@@ -389,8 +406,26 @@ def setup_openinference_tracing(
             headers={},
         )
 
-        # Add batch processor
-        tracer_provider.add_span_processor(BatchSpanProcessor(exporter))
+        # Create span processor with optional filtering
+        base_processor = BatchSpanProcessor(exporter)
+
+        if filter_a2a_noise:
+            # Wrap with filtering processor to remove A2A SDK noise
+            # Filter spans that start with a2a.server.*, a2a.client.*, etc.
+            span_processor = FilteringSpanProcessor(
+                delegate_processor=base_processor,
+                excluded_span_prefixes=[
+                    "a2a.server.",
+                    "a2a.client.",
+                    "a2a.events.",
+                ],
+                excluded_scopes=["a2a-python-sdk"],
+            )
+            logger.debug("A2A noise filtering enabled")
+        else:
+            span_processor = base_processor
+
+        tracer_provider.add_span_processor(span_processor)
 
         # Set as global tracer provider
         trace_api.set_tracer_provider(tracer_provider)
@@ -399,9 +434,10 @@ def setup_openinference_tracing(
         LangChainInstrumentor().instrument(tracer_provider=tracer_provider)
 
         logger.info(
-            "Phoenix tracing enabled: project=%s, endpoint=%s",
+            "Phoenix tracing enabled: project=%s, endpoint=%s, filter_a2a=%s",
             project_name,
             endpoint,
+            filter_a2a_noise,
         )
         return True
 

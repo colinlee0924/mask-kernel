@@ -352,15 +352,19 @@ class SimpleAgent(BaseAgent):
         # Add session/thread configuration for LangGraph
         if session_id:
             config["configurable"] = {"thread_id": session_id}
+            # Set session.id for Phoenix/OpenInference session tracking
+            config["metadata"] = {"session.id": session_id}
 
         # Always use LangGraph agent (create_agent) for proper trace structure
         # Even with empty tools, this ensures Phoenix/Langfuse see full execution details:
         # LangGraph → model → ChatAnthropic (like basic-observability-examples)
         graph = self._get_graph(tools)  # tools can be empty list
-        result = await graph.ainvoke(
-            {"messages": messages},
-            config=config,
+
+        # Use OpenInference session context if available for Phoenix tracking
+        result = await self._invoke_with_session_context(
+            graph, messages, config, session_id
         )
+
         # Extract last message from result
         result_messages = result.get("messages", [])
         if result_messages:
@@ -376,6 +380,24 @@ class SimpleAgent(BaseAgent):
             await self._save_session(session)
 
         return response_content
+
+    async def _invoke_with_session_context(
+        self,
+        graph: Any,
+        messages: List[BaseMessage],
+        config: Dict[str, Any],
+        session_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """Invoke graph with optional session context for Phoenix tracking."""
+        if session_id:
+            try:
+                from openinference.instrumentation import using_session
+
+                with using_session(session_id):
+                    return await graph.ainvoke({"messages": messages}, config=config)
+            except ImportError:
+                pass
+        return await graph.ainvoke({"messages": messages}, config=config)
 
     async def stream(
         self,
@@ -417,30 +439,60 @@ class SimpleAgent(BaseAgent):
         # Add session/thread configuration for LangGraph
         if session_id:
             config["configurable"] = {"thread_id": session_id}
+            # Set session.id for Phoenix/OpenInference session tracking
+            config["metadata"] = {"session.id": session_id}
 
         # Always use LangGraph agent (create_agent) for proper trace structure
         full_response = ""
         graph = self._get_graph(tools)  # tools can be empty list
 
-        async for event in graph.astream(
-            {"messages": messages},
-            config=config,
-            stream_mode="messages",
+        # Use OpenInference session context if available for Phoenix tracking
+        async for chunk in self._stream_with_session_context(
+            graph, messages, config, session_id
         ):
-            # Extract content from streaming events
-            if isinstance(event, tuple) and len(event) == 2:
-                msg, metadata = event
-                if hasattr(msg, "content") and msg.content:
-                    content = msg.content
-                    if isinstance(content, str):
-                        full_response += content
-                        yield content
+            full_response += chunk
+            yield chunk
 
         # Update session
         if session:
             session.add_message(HumanMessage(content=message))
             session.add_message(AIMessage(content=full_response))
             await self._save_session(session)
+
+    async def _stream_with_session_context(
+        self,
+        graph: Any,
+        messages: List[BaseMessage],
+        config: Dict[str, Any],
+        session_id: Optional[str],
+    ) -> AsyncIterator[str]:
+        """Stream graph with optional session context for Phoenix tracking."""
+        session_context = None
+        if session_id:
+            try:
+                from openinference.instrumentation import using_session
+
+                session_context = using_session(session_id)
+                session_context.__enter__()
+            except ImportError:
+                session_context = None
+
+        try:
+            async for event in graph.astream(
+                {"messages": messages},
+                config=config,
+                stream_mode="messages",
+            ):
+                # Extract content from streaming events
+                if isinstance(event, tuple) and len(event) == 2:
+                    msg, metadata = event
+                    if hasattr(msg, "content") and msg.content:
+                        content = msg.content
+                        if isinstance(content, str):
+                            yield content
+        finally:
+            if session_context:
+                session_context.__exit__(None, None, None)
 
     def _extract_content(self, response: Any) -> str:
         """Extract text content from model response.
