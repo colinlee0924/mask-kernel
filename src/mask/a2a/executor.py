@@ -80,16 +80,48 @@ class MaskAgentExecutor(AgentExecutor):
             session_id or "none",
         )
 
+        # Set session context at executor level so root span gets session.id
+        # Phoenix only recognizes session.id on root spans (parent is null)
         try:
-            if self.stream:
-                await self._execute_streaming(user_message, event_queue, session_id)
-            else:
-                await self._execute_non_streaming(user_message, event_queue, session_id)
+            if session_id:
+                try:
+                    from openinference.instrumentation import using_session
+
+                    with using_session(session_id):
+                        await self._execute_with_error_handling(
+                            user_message, event_queue, session_id
+                        )
+                    return
+                except ImportError:
+                    pass
+
+            # No session or using_session not available
+            await self._execute_with_error_handling(
+                user_message, event_queue, session_id
+            )
         except Exception as e:
             logger.exception("Agent execution failed: %s", e)
             await event_queue.enqueue_event(
                 new_agent_text_message(f"Error: {str(e)}")
             )
+
+    async def _execute_with_error_handling(
+        self,
+        message: str,
+        event_queue: EventQueue,
+        session_id: str = None,
+    ) -> None:
+        """Execute agent with proper error handling.
+
+        Args:
+            message: User message.
+            event_queue: Event queue for responses.
+            session_id: Optional session ID for trace grouping.
+        """
+        if self.stream:
+            await self._execute_streaming(message, event_queue, session_id)
+        else:
+            await self._execute_non_streaming(message, event_queue, session_id)
 
     async def _execute_non_streaming(
         self,
