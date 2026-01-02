@@ -352,8 +352,8 @@ class SimpleAgent(BaseAgent):
         # Add session/thread configuration for LangGraph
         if session_id:
             config["configurable"] = {"thread_id": session_id}
-            # Set session.id for Phoenix/OpenInference session tracking
-            config["metadata"] = {"session.id": session_id}
+            # Note: session.id is set at executor level via using_session()
+            # Do NOT set session.id in metadata - it interferes with Phoenix tracking
 
         # Always use LangGraph agent (create_agent) for proper trace structure
         # Even with empty tools, this ensures Phoenix/Langfuse see full execution details:
@@ -388,15 +388,12 @@ class SimpleAgent(BaseAgent):
         config: Dict[str, Any],
         session_id: Optional[str],
     ) -> Dict[str, Any]:
-        """Invoke graph with optional session context for Phoenix tracking."""
-        if session_id:
-            try:
-                from openinference.instrumentation import using_session
+        """Invoke graph.
 
-                with using_session(session_id):
-                    return await graph.ainvoke({"messages": messages}, config=config)
-            except ImportError:
-                pass
+        Note: Session context is set at executor level (MaskAgentExecutor)
+        using using_session(). Do NOT set it here - Phoenix requires
+        session.id on root spans only.
+        """
         return await graph.ainvoke({"messages": messages}, config=config)
 
     async def stream(
@@ -439,8 +436,8 @@ class SimpleAgent(BaseAgent):
         # Add session/thread configuration for LangGraph
         if session_id:
             config["configurable"] = {"thread_id": session_id}
-            # Set session.id for Phoenix/OpenInference session tracking
-            config["metadata"] = {"session.id": session_id}
+            # Note: session.id is set at executor level via using_session()
+            # Do NOT set session.id in metadata - it interferes with Phoenix tracking
 
         # Always use LangGraph agent (create_agent) for proper trace structure
         full_response = ""
@@ -466,33 +463,24 @@ class SimpleAgent(BaseAgent):
         config: Dict[str, Any],
         session_id: Optional[str],
     ) -> AsyncIterator[str]:
-        """Stream graph with optional session context for Phoenix tracking."""
-        session_context = None
-        if session_id:
-            try:
-                from openinference.instrumentation import using_session
+        """Stream graph.
 
-                session_context = using_session(session_id)
-                session_context.__enter__()
-            except ImportError:
-                session_context = None
-
-        try:
-            async for event in graph.astream(
-                {"messages": messages},
-                config=config,
-                stream_mode="messages",
-            ):
-                # Extract content from streaming events
-                if isinstance(event, tuple) and len(event) == 2:
-                    msg, metadata = event
-                    if hasattr(msg, "content") and msg.content:
-                        content = msg.content
-                        if isinstance(content, str):
-                            yield content
-        finally:
-            if session_context:
-                session_context.__exit__(None, None, None)
+        Note: Session context is set at executor level (MaskAgentExecutor)
+        using using_session(). Do NOT set it here - Phoenix requires
+        session.id on root spans only.
+        """
+        async for event in graph.astream(
+            {"messages": messages},
+            config=config,
+            stream_mode="messages",
+        ):
+            # Extract content from streaming events
+            if isinstance(event, tuple) and len(event) == 2:
+                msg, metadata = event
+                if hasattr(msg, "content") and msg.content:
+                    content = msg.content
+                    if isinstance(content, str):
+                        yield content
 
     def _extract_content(self, response: Any) -> str:
         """Extract text content from model response.
