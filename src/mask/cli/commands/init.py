@@ -162,7 +162,7 @@ def init_command(
 def _write_pyproject_toml(project_dir: Path, context: dict) -> None:
     """Write pyproject.toml."""
     # Use GitHub URL since mask-kernel is not on PyPI yet
-    mask_kernel_dep = "mask-kernel @ git+https://github.com/colinlee0924/mask-kernel.git"
+    mask_kernel_dep = "mask-kernel[phoenix,anthropic] @ git+https://github.com/colinlee0924/mask-kernel.git"
 
     content = f'''[build-system]
 requires = ["hatchling"]
@@ -177,12 +177,15 @@ requires-python = ">=3.10"
 
 dependencies = [
     "{mask_kernel_dep}",
+    "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24.0",
+    "httpx>=0.27.0",
+    "a2a-sdk>=0.3.0",
 ]
 
 [tool.hatch.metadata]
@@ -238,13 +241,13 @@ ANTHROPIC_API_KEY=your-anthropic-key
 # MASK Configuration
 MASK_LLM_PROVIDER=anthropic
 
-# Langfuse Observability (optional)
-LANGFUSE_SECRET_KEY=your-langfuse-project-secret-key
-LANGFUSE_PUBLIC_KEY=your-langfuse-project-public-key
-LANGFUSE_BASE_URL=http://localhost:3001
+# Phoenix Observability (recommended - default)
+PHOENIX_COLLECTOR_ENDPOINT=http://localhost:6006
 
-# Phoenix Observability (optional)
-# PHOENIX_COLLECTOR_ENDPOINT=http://localhost:6006
+# Langfuse Observability (optional alternative)
+# LANGFUSE_SECRET_KEY=your-langfuse-project-secret-key
+# LANGFUSE_PUBLIC_KEY=your-langfuse-project-public-key
+# LANGFUSE_BASE_URL=http://localhost:3001
 '''
     if context["with_mcp"]:
         content += '''
@@ -334,13 +337,29 @@ def _write_main_py(project_dir: Path, context: dict) -> None:
     if context["with_a2a"]:
         content = f'''"""Main entry point for {context["project_name"]} A2A server."""
 
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
 from mask.a2a import MaskA2AServer
+from mask.observability import setup_openinference_tracing
 
 from {context["module_name"]}.agent import create_agent
+
+# Load .env file from project root
+env_path = Path(__file__).parent.parent.parent / ".env"
+load_dotenv(env_path)
 
 
 def main():
     """Start the A2A server."""
+    # Setup Phoenix tracing (filters A2A noise by default)
+    setup_openinference_tracing(
+        project_name="{context["project_name"]}",
+        endpoint=os.environ.get("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006"),
+    )
+
     agent = create_agent()
 
     server = MaskA2AServer(
@@ -470,3 +489,113 @@ async def test_agent_invoke():
 '''
     (project_dir / "tests" / "test_agent.py").write_text(content, encoding="utf-8")
     (project_dir / "tests" / "__init__.py").write_text("", encoding="utf-8")
+
+    # Also write A2A test script if with_a2a
+    if context.get("with_a2a", True):
+        _write_a2a_test_script(project_dir, context)
+
+
+def _write_a2a_test_script(project_dir: Path, context: dict) -> None:
+    """Write A2A integration test script."""
+    content = f'''"""A2A Integration Test for {context["project_name"]}.
+
+Usage:
+    1. Start the agent server: python -m {context["module_name"]}.main
+    2. Run this test: python tests/test_a2a.py
+
+Prerequisites:
+    - Agent server running on http://localhost:10001
+    - Phoenix running on http://localhost:6006 (for observability)
+"""
+
+import asyncio
+import logging
+from uuid import uuid4
+
+import httpx
+from a2a.client import A2ACardResolver, A2AClient
+from a2a.types import MessageSendParams, SendMessageRequest
+
+
+async def main() -> None:
+    """Send test messages to {context["project_name"]}."""
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+
+    base_url = "http://localhost:10001"
+
+    async with httpx.AsyncClient() as httpx_client:
+        # Initialize resolver and get agent card
+        resolver = A2ACardResolver(
+            httpx_client=httpx_client,
+            base_url=base_url,
+        )
+
+        try:
+            agent_card = await resolver.get_agent_card()
+            logger.info(f"Agent card fetched: {{agent_card.name}}")
+        except Exception as e:
+            logger.error(f"Failed to fetch agent card: {{e}}")
+            logger.error("Make sure the agent server is running!")
+            raise
+
+        # Initialize client
+        client = A2AClient(httpx_client=httpx_client, agent_card=agent_card)
+
+        # Test questions
+        test_questions = [
+            "What is 2 + 2?",
+            "Explain what Python is in one sentence.",
+            "What is the capital of France?",
+        ]
+
+        logger.info("\\n" + "=" * 60)
+        logger.info("{context["project_name"]} A2A Test")
+        logger.info("=" * 60)
+
+        for i, question in enumerate(test_questions, 1):
+            logger.info(f"\\n--- Test {{i}}/{{len(test_questions)}} ---")
+            logger.info(f"Question: {{question}}")
+
+            # Prepare request
+            send_message_payload = {{
+                "message": {{
+                    "role": "user",
+                    "parts": [{{"kind": "text", "text": question}}],
+                    "messageId": uuid4().hex,
+                }},
+            }}
+
+            request = SendMessageRequest(
+                id=str(uuid4()), params=MessageSendParams(**send_message_payload)
+            )
+
+            try:
+                response = await client.send_message(request)
+
+                # Extract response text
+                if hasattr(response, "message") and response.message:
+                    result_text = response.message.parts[0].text
+                elif hasattr(response, "data") and response.data:
+                    result_text = str(response.data)
+                else:
+                    result_text = str(response.model_dump())
+
+                logger.info(f"Response: {{result_text[:200]}}...")
+                logger.info("✅ Request successful")
+            except Exception as e:
+                logger.error(f"❌ Request failed: {{e}}", exc_info=True)
+
+        logger.info("\\n" + "=" * 60)
+        logger.info("Test Complete!")
+        logger.info("=" * 60)
+        logger.info("\\nCheck Phoenix UI (http://localhost:6006):")
+        logger.info(f"  - Project: {context["project_name"]}")
+        logger.info("  - Trace structure: Agent → model → ChatAnthropic")
+        logger.info("=" * 60)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+'''
+    (project_dir / "tests" / "test_a2a.py").write_text(content, encoding="utf-8")
