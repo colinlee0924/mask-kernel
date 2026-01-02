@@ -549,20 +549,26 @@ async def main() -> None:
             "What is the capital of France?",
         ]
 
+        # Use same contextId for all messages in this session
+        # This groups all traces under one session in Phoenix
+        context_id = uuid4().hex
+
         logger.info("\\n" + "=" * 60)
         logger.info("{context["project_name"]} A2A Test")
+        logger.info(f"Session (contextId): {{context_id}}")
         logger.info("=" * 60)
 
         for i, question in enumerate(test_questions, 1):
             logger.info(f"\\n--- Test {{i}}/{{len(test_questions)}} ---")
             logger.info(f"Question: {{question}}")
 
-            # Prepare request
+            # Prepare request with contextId for session grouping
             send_message_payload = {{
                 "message": {{
                     "role": "user",
                     "parts": [{{"kind": "text", "text": question}}],
                     "messageId": uuid4().hex,
+                    "contextId": context_id,  # Same contextId = same session
                 }},
             }}
 

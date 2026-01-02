@@ -155,25 +155,24 @@ class MaskAgentExecutor(AgentExecutor):
     def _extract_session_id(self, context: RequestContext) -> str | None:
         """Extract session ID from A2A request context.
 
+        A2A uses context_id (contextId in JSON) as the session/conversation identifier.
+        This allows multiple traces to be grouped under one session in Phoenix.
+
         Args:
             context: The request context.
 
         Returns:
             Session ID if found, None otherwise.
         """
-        # Try to get session ID from message metadata or context
-        if hasattr(context, "session_id") and context.session_id:
-            return context.session_id
-
-        # A2A protocol may use conversation_id or other fields
+        # Check message for context_id (from A2A Message.contextId)
         message = context.message
         if message:
-            # Check for conversation_id in message
-            if hasattr(message, "conversation_id") and message.conversation_id:
-                return message.conversation_id
-            # Check for messageId as fallback for grouping
-            if hasattr(message, "message_id") and message.message_id:
-                return message.message_id
+            if hasattr(message, "context_id") and message.context_id:
+                return message.context_id
+
+        # Fallback: check RequestContext for context_id
+        if hasattr(context, "context_id") and context.context_id:
+            return context.context_id
 
         return None
 
