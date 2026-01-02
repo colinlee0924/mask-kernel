@@ -71,13 +71,20 @@ class MaskAgentExecutor(AgentExecutor):
             )
             return
 
-        logger.debug("Executing agent with message: %s...", user_message[:50])
+        # Extract session ID for observability trace grouping
+        session_id = self._extract_session_id(context)
+
+        logger.debug(
+            "Executing agent with message: %s... (session: %s)",
+            user_message[:50],
+            session_id or "none",
+        )
 
         try:
             if self.stream:
-                await self._execute_streaming(user_message, event_queue)
+                await self._execute_streaming(user_message, event_queue, session_id)
             else:
-                await self._execute_non_streaming(user_message, event_queue)
+                await self._execute_non_streaming(user_message, event_queue, session_id)
         except Exception as e:
             logger.exception("Agent execution failed: %s", e)
             await event_queue.enqueue_event(
@@ -88,14 +95,16 @@ class MaskAgentExecutor(AgentExecutor):
         self,
         message: str,
         event_queue: EventQueue,
+        session_id: str = None,
     ) -> None:
         """Execute agent without streaming.
 
         Args:
             message: User message.
             event_queue: Event queue for responses.
+            session_id: Optional session ID for trace grouping.
         """
-        response = await self.agent.invoke(message)
+        response = await self.agent.invoke(message, session_id=session_id)
         await event_queue.enqueue_event(
             new_agent_text_message(response)
         )
@@ -104,15 +113,17 @@ class MaskAgentExecutor(AgentExecutor):
         self,
         message: str,
         event_queue: EventQueue,
+        session_id: str = None,
     ) -> None:
         """Execute agent with streaming.
 
         Args:
             message: User message.
             event_queue: Event queue for responses.
+            session_id: Optional session ID for trace grouping.
         """
         full_response = ""
-        async for chunk in self.agent.stream(message):
+        async for chunk in self.agent.stream(message, session_id=session_id):
             full_response += chunk
             # Note: A2A streaming events could be sent here
             # For now, we collect and send final response
@@ -140,6 +151,31 @@ class MaskAgentExecutor(AgentExecutor):
                     return part.text
 
         return ""
+
+    def _extract_session_id(self, context: RequestContext) -> str | None:
+        """Extract session ID from A2A request context.
+
+        Args:
+            context: The request context.
+
+        Returns:
+            Session ID if found, None otherwise.
+        """
+        # Try to get session ID from message metadata or context
+        if hasattr(context, "session_id") and context.session_id:
+            return context.session_id
+
+        # A2A protocol may use conversation_id or other fields
+        message = context.message
+        if message:
+            # Check for conversation_id in message
+            if hasattr(message, "conversation_id") and message.conversation_id:
+                return message.conversation_id
+            # Check for messageId as fallback for grouping
+            if hasattr(message, "message_id") and message.message_id:
+                return message.message_id
+
+        return None
 
     async def cancel(
         self,

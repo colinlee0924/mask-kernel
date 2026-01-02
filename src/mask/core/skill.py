@@ -172,23 +172,22 @@ class MarkdownSkill(BaseSkill):
 
         The loader tool returns the skill's instructions when called.
         """
-        from langchain_core.tools import tool
+        from langchain_core.tools import StructuredTool
 
         skill_name = self.metadata.name
         instructions = self._instructions
 
-        @tool(name=f"use_{skill_name.replace('-', '_')}")
         def loader() -> str:
-            """Load and activate this skill.
-
-            Returns the skill's instructions and usage guidelines.
-            """
+            """Load and activate this skill."""
             return instructions
 
-        # Update tool description
-        loader.description = f"Activate the {skill_name} skill. {self.metadata.description}"
-
-        return loader
+        # Create tool with custom name using StructuredTool
+        tool_name = f"use_{skill_name.replace('-', '_')}"
+        return StructuredTool.from_function(
+            func=loader,
+            name=tool_name,
+            description=f"Activate the {skill_name} skill. {self.metadata.description}",
+        )
 
     def get_instructions(self) -> str:
         """Return the full instructions from SKILL.md."""

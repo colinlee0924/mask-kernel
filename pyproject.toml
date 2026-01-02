@@ -54,6 +54,7 @@ observability = [
 # Observability - Phoenix (simpler setup, good for development)
 phoenix = [
     "arize-phoenix>=4.0",
+    "arize-phoenix-otel>=0.1.0",  # For phoenix.otel.register()
     "openinference-instrumentation-langchain>=0.1.0",
 ]
 
