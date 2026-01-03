@@ -12,6 +12,12 @@ from a2a.server.events import EventQueue
 from a2a.types import TaskState, TaskStatus
 from a2a.utils import new_agent_text_message
 
+from mask.observability.attributes import (
+    set_span_io,
+    set_span_metadata,
+    set_span_session,
+)
+
 if TYPE_CHECKING:
     from mask.agent.base_agent import BaseAgent
 
@@ -102,9 +108,10 @@ class MaskAgentExecutor(AgentExecutor):
     ) -> None:
         """Execute agent with OpenTelemetry tracing.
 
-        Creates a clean root span with user-friendly name and OpenInference
-        attributes for better Phoenix display. This span becomes the primary
-        trace root, replacing the verbose A2A SDK span names.
+        Creates a clean root span with user-friendly name and multi-backend
+        compatible attributes (Phoenix/OpenInference, Langfuse, GenAI).
+        This span becomes the primary trace root, replacing the verbose
+        A2A SDK span names.
         """
         # Use server_name for root span (distinguishes from LangGraph agent name)
         # Falls back to agent name if server_name not provided
@@ -123,16 +130,14 @@ class MaskAgentExecutor(AgentExecutor):
                 name=span_name,
                 context=Context(),  # Empty context = no parent = root span
                 attributes={
-                    "input.value": message,
-                    "input.mime_type": "text/plain",
-                    "mask.agent.name": agent_name,
-                    "mask.server.name": span_name,
                     "openinference.span.kind": "AGENT",
                 },
             ) as span:
-                # Set session.id for Phoenix session linking
-                if session_id:
-                    span.set_attribute("session.id", session_id)
+                # Use multi-backend attribute utilities for compatibility
+                # with Phoenix, Langfuse, and OpenTelemetry GenAI
+                set_span_io(span, input_value=message)
+                set_span_session(span, session_id=session_id, trace_name=span_name)
+                set_span_metadata(span, agent_name=agent_name, server_name=span_name)
 
                 # Execute with session context for child spans
                 if session_id:
@@ -152,10 +157,9 @@ class MaskAgentExecutor(AgentExecutor):
                         message, event_queue, session_id
                     )
 
-                # Set output after execution
+                # Set output after execution (multi-backend compatible)
                 if response_text:
-                    span.set_attribute("output.value", response_text)
-                    span.set_attribute("output.mime_type", "text/plain")
+                    set_span_io(span, output_value=response_text)
 
         except ImportError:
             logger.debug("OpenTelemetry not available, executing without tracing")

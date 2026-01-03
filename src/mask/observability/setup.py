@@ -255,6 +255,129 @@ def shutdown_langfuse() -> None:
             _langfuse_client = None
 
 
+def setup_langfuse_otel_tracing(
+    public_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    filter_a2a_noise: bool = True,
+) -> bool:
+    """Set up Langfuse tracing via OpenTelemetry OTLP exporter.
+
+    This is an alternative to the callback-based approach. It uses the same
+    OpenTelemetry infrastructure as Phoenix, making it easier to switch between
+    backends or use both simultaneously.
+
+    Args:
+        public_key: Langfuse public key. If not provided, uses
+            LANGFUSE_PUBLIC_KEY environment variable.
+        secret_key: Langfuse secret key. If not provided, uses
+            LANGFUSE_SECRET_KEY environment variable.
+        base_url: Langfuse server URL. If not provided, uses
+            LANGFUSE_BASE_URL environment variable or defaults to cloud.
+        filter_a2a_noise: If True (default), filter out A2A SDK infrastructure
+            spans to reduce noise.
+
+    Returns:
+        True if setup was successful, False otherwise.
+
+    Example:
+        from mask.observability import setup_langfuse_otel_tracing
+
+        # Setup tracing before creating agents
+        setup_langfuse_otel_tracing()
+
+        # Now all LangChain operations will be traced to Langfuse
+        agent = create_mask_agent()
+    """
+    try:
+        from openinference.instrumentation.langchain import LangChainInstrumentor
+        from opentelemetry import trace as trace_api
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+            OTLPSpanExporter,
+        )
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    except ImportError:
+        logger.warning(
+            "OpenTelemetry packages not installed. "
+            "Install with: pip install mask-kernel[phoenix]"
+        )
+        return False
+
+    # Get credentials from args or environment
+    public_key = public_key or os.environ.get("LANGFUSE_PUBLIC_KEY")
+    secret_key = secret_key or os.environ.get("LANGFUSE_SECRET_KEY")
+    base_url = base_url or os.environ.get(
+        "LANGFUSE_BASE_URL", "https://cloud.langfuse.com"
+    )
+
+    if not public_key or not secret_key:
+        logger.warning(
+            "Langfuse credentials not configured. "
+            "Set LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY environment variables."
+        )
+        return False
+
+    try:
+        # Langfuse OTEL endpoint
+        otel_endpoint = f"{base_url.rstrip('/')}/api/public/otel/v1/traces"
+
+        # Create resource with service name
+        resource = Resource({"service.name": "mask-agent"})
+
+        # Create tracer provider
+        tracer_provider = TracerProvider(resource=resource)
+
+        # Create exporter with Langfuse authentication headers
+        # Langfuse uses Basic auth: base64(public_key:secret_key)
+        import base64
+        auth_token = base64.b64encode(
+            f"{public_key}:{secret_key}".encode()
+        ).decode()
+
+        exporter = OTLPSpanExporter(
+            endpoint=otel_endpoint,
+            headers={"Authorization": f"Basic {auth_token}"},
+        )
+
+        # Create span processor with optional filtering
+        base_processor = BatchSpanProcessor(exporter)
+
+        if filter_a2a_noise:
+            span_processor = FilteringSpanProcessor(
+                delegate_processor=base_processor,
+                excluded_span_prefixes=[
+                    "a2a.server.",
+                    "a2a.client.",
+                    "a2a.events.",
+                ],
+                excluded_scopes=["a2a-python-sdk"],
+            )
+            logger.debug("A2A noise filtering enabled for Langfuse")
+        else:
+            span_processor = base_processor
+
+        tracer_provider.add_span_processor(span_processor)
+
+        # Set as global tracer provider
+        trace_api.set_tracer_provider(tracer_provider)
+
+        # Instrument LangChain
+        LangChainInstrumentor().instrument(tracer_provider=tracer_provider)
+
+        logger.info(
+            "Langfuse OTEL tracing enabled: endpoint=%s, filter_a2a=%s",
+            otel_endpoint,
+            filter_a2a_noise,
+        )
+        return True
+
+    except Exception as e:
+        logger.warning("Failed to setup Langfuse OTEL tracing: %s", e)
+        return False
+
+
 # =============================================================================
 # Phoenix/OpenInference (Recommended)
 # =============================================================================
