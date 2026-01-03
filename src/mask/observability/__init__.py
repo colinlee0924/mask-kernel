@@ -46,6 +46,8 @@ from mask.observability.setup import (
     # Phoenix
     setup_openinference_tracing,
     setup_console_tracing,
+    # Dual (Phoenix + Langfuse)
+    setup_dual_tracing,
     # Common
     disable_tracing,
 )
@@ -68,6 +70,8 @@ __all__ = [
     # Phoenix
     "setup_openinference_tracing",
     "setup_console_tracing",
+    # Dual (Phoenix + Langfuse)
+    "setup_dual_tracing",
     # Common
     "disable_tracing",
     # Multi-backend attribute utilities

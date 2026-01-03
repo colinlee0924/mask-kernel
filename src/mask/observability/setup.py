@@ -378,6 +378,174 @@ def setup_langfuse_otel_tracing(
         return False
 
 
+def setup_dual_tracing(
+    project_name: str = "mask-agent",
+    phoenix_endpoint: Optional[str] = None,
+    langfuse_public_key: Optional[str] = None,
+    langfuse_secret_key: Optional[str] = None,
+    langfuse_base_url: Optional[str] = None,
+    filter_a2a_noise: bool = True,
+) -> bool:
+    """Set up dual tracing to both Phoenix and Langfuse simultaneously.
+
+    This allows you to view traces in both Phoenix (local development) and
+    Langfuse (team collaboration, long-term tracking) at the same time.
+
+    Args:
+        project_name: Name of the project for trace grouping.
+        phoenix_endpoint: Phoenix endpoint URL. If not provided, uses
+            PHOENIX_COLLECTOR_ENDPOINT env var or defaults to local.
+        langfuse_public_key: Langfuse public key. If not provided, uses
+            LANGFUSE_PUBLIC_KEY environment variable.
+        langfuse_secret_key: Langfuse secret key. If not provided, uses
+            LANGFUSE_SECRET_KEY environment variable.
+        langfuse_base_url: Langfuse server URL. If not provided, uses
+            LANGFUSE_BASE_URL environment variable or defaults to cloud.
+        filter_a2a_noise: If True (default), filter out A2A SDK infrastructure
+            spans to reduce noise.
+
+    Returns:
+        True if setup was successful, False otherwise.
+
+    Example:
+        from mask.observability import setup_dual_tracing
+
+        # Setup dual tracing - sends to both Phoenix and Langfuse
+        setup_dual_tracing("my-agent")
+
+        # Now all traces go to both backends
+        agent = create_mask_agent()
+    """
+    try:
+        from openinference.instrumentation.langchain import LangChainInstrumentor
+        from opentelemetry import trace as trace_api
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+            OTLPSpanExporter,
+        )
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    except ImportError:
+        logger.warning(
+            "OpenTelemetry packages not installed. "
+            "Install with: pip install mask-kernel[phoenix]"
+        )
+        return False
+
+    # Get Phoenix endpoint
+    if phoenix_endpoint is None:
+        phoenix_endpoint = os.environ.get(
+            "PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006"
+        )
+
+    # Get Langfuse credentials
+    langfuse_public_key = langfuse_public_key or os.environ.get("LANGFUSE_PUBLIC_KEY")
+    langfuse_secret_key = langfuse_secret_key or os.environ.get("LANGFUSE_SECRET_KEY")
+    langfuse_base_url = langfuse_base_url or os.environ.get(
+        "LANGFUSE_BASE_URL", "https://cloud.langfuse.com"
+    )
+
+    # Check if Langfuse credentials are available
+    has_langfuse = langfuse_public_key and langfuse_secret_key
+
+    if not has_langfuse:
+        logger.warning(
+            "Langfuse credentials not configured. "
+            "Only Phoenix tracing will be enabled. "
+            "Set LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY for dual tracing."
+        )
+
+    try:
+        # Create resource with project name
+        try:
+            from phoenix.otel import PROJECT_NAME
+            resource = Resource({PROJECT_NAME: project_name})
+        except ImportError:
+            resource = Resource({"service.name": project_name})
+
+        # Create tracer provider
+        tracer_provider = TracerProvider(resource=resource)
+
+        # Define A2A noise filter settings
+        excluded_prefixes = ["a2a.server.", "a2a.client.", "a2a.events."]
+        excluded_scopes = ["a2a-python-sdk"]
+
+        # =====================================================================
+        # Add Phoenix Exporter
+        # =====================================================================
+        phoenix_exporter = OTLPSpanExporter(
+            endpoint=f"{phoenix_endpoint}/v1/traces",
+            headers={},
+        )
+        phoenix_base_processor = BatchSpanProcessor(phoenix_exporter)
+
+        if filter_a2a_noise:
+            phoenix_processor = FilteringSpanProcessor(
+                delegate_processor=phoenix_base_processor,
+                excluded_span_prefixes=excluded_prefixes,
+                excluded_scopes=excluded_scopes,
+            )
+        else:
+            phoenix_processor = phoenix_base_processor
+
+        tracer_provider.add_span_processor(phoenix_processor)
+        logger.info("Phoenix tracing added: endpoint=%s", phoenix_endpoint)
+
+        # =====================================================================
+        # Add Langfuse Exporter (if credentials available)
+        # =====================================================================
+        if has_langfuse:
+            import base64
+            auth_token = base64.b64encode(
+                f"{langfuse_public_key}:{langfuse_secret_key}".encode()
+            ).decode()
+
+            langfuse_endpoint = f"{langfuse_base_url.rstrip('/')}/api/public/otel/v1/traces"
+            langfuse_exporter = OTLPSpanExporter(
+                endpoint=langfuse_endpoint,
+                headers={"Authorization": f"Basic {auth_token}"},
+            )
+            langfuse_base_processor = BatchSpanProcessor(langfuse_exporter)
+
+            if filter_a2a_noise:
+                langfuse_processor = FilteringSpanProcessor(
+                    delegate_processor=langfuse_base_processor,
+                    excluded_span_prefixes=excluded_prefixes,
+                    excluded_scopes=excluded_scopes,
+                )
+            else:
+                langfuse_processor = langfuse_base_processor
+
+            tracer_provider.add_span_processor(langfuse_processor)
+            logger.info("Langfuse tracing added: endpoint=%s", langfuse_endpoint)
+
+        # Set as global tracer provider
+        trace_api.set_tracer_provider(tracer_provider)
+
+        # Instrument LangChain
+        LangChainInstrumentor().instrument(tracer_provider=tracer_provider)
+
+        if has_langfuse:
+            logger.info(
+                "Dual tracing enabled: Phoenix=%s, Langfuse=%s, filter_a2a=%s",
+                phoenix_endpoint,
+                langfuse_base_url,
+                filter_a2a_noise,
+            )
+        else:
+            logger.info(
+                "Single tracing enabled (Phoenix only): endpoint=%s, filter_a2a=%s",
+                phoenix_endpoint,
+                filter_a2a_noise,
+            )
+
+        return True
+
+    except Exception as e:
+        logger.warning("Failed to setup dual tracing: %s", e)
+        return False
+
+
 # =============================================================================
 # Phoenix/OpenInference (Recommended)
 # =============================================================================
