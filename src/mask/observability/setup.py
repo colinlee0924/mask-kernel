@@ -266,11 +266,9 @@ class FilteringSpanProcessor:
     用於過濾 A2A SDK 等基礎設施層級的 traces，讓開發者專注於業務邏輯。
     支援按 instrumentation scope 名稱或 span 名稱前綴過濾。
 
-    IMPORTANT: Root spans（沒有 parent 的 span）永遠不會被過濾！
-    這對 Phoenix session 功能至關重要，因為 Phoenix 依賴 root span 來：
-    - 計算 Total Tokens
-    - 提供 "View Trace" 連結
-    - 在 session dialog 中顯示 trace 列表
+    NOTE: 所有匹配的 spans（包括 root spans）都會被過濾。
+    MaskAgentExecutor 會創建自己的 root span，帶有用戶友好的名稱和
+    OpenInference 屬性，所以 A2A SDK 的 spans 可以安全過濾。
 
     Example:
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -314,22 +312,12 @@ class FilteringSpanProcessor:
         """
         span_name = span.name or ""
 
-        # CRITICAL: 永遠不要過濾 root span！
-        # Phoenix 需要 root span 來正確顯示 session 功能（Total Tokens、View Trace 連結等）
-        # Root span 是沒有 parent 或 parent span_id 無效的 span
-        is_root_span = False
-        if span.parent is None:
-            is_root_span = True
-        elif not span.parent.is_valid:
-            is_root_span = True
-
-        if is_root_span:
-            logger.debug(
-                "Preserving root span (required for Phoenix session): %s",
-                span_name
-            )
-            self.delegate_processor.on_end(span)
-            return
+        # 過濾所有 A2A SDK spans（包括 root spans）
+        # MaskAgentExecutor 會創建自己的 root span，帶有：
+        # - 用戶友好的名稱（agent name）
+        # - OpenInference 屬性（input.value, output.value）
+        # - session.id 用於 Phoenix session 功能
+        # 所以 A2A SDK 的 spans 現在是多餘的雜訊
 
         # 檢查 span 名稱前綴
         for prefix in self.excluded_span_prefixes:

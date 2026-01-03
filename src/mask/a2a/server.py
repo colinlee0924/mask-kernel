@@ -116,8 +116,12 @@ class MaskA2AServer:
         Returns:
             A2AStarletteApplication instance.
         """
-        # Create executor
-        executor = MaskAgentExecutor(self.agent, stream=self.stream)
+        # Create executor with server name for trace display
+        executor = MaskAgentExecutor(
+            self.agent,
+            stream=self.stream,
+            server_name=self.name,
+        )
 
         # Create agent card
         agent_card = self.create_agent_card(host, port)

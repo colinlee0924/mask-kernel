@@ -40,15 +40,19 @@ class MaskAgentExecutor(AgentExecutor):
         self,
         agent: "BaseAgent",
         stream: bool = False,
+        server_name: str = None,
     ) -> None:
         """Initialize executor with MASK agent.
 
         Args:
             agent: The BaseAgent instance to execute.
             stream: Whether to use streaming responses.
+            server_name: A2A server name for trace display (e.g., "phase1-agent-github").
+                        If not provided, falls back to agent name.
         """
         self.agent = agent
         self.stream = stream
+        self.server_name = server_name
 
     async def execute(
         self,
@@ -80,88 +84,125 @@ class MaskAgentExecutor(AgentExecutor):
             session_id or "none",
         )
 
-        # Use using_session context for Phoenix session tracking
-        # This sets session.id on all spans created within this context
+        # Create a user-friendly root span for Phoenix display
+        # This wraps the A2A infrastructure spans with a readable agent name
         try:
-            if session_id:
-                try:
-                    from openinference.instrumentation import using_session
-
-                    with using_session(session_id):
-                        await self._execute_with_error_handling(
-                            user_message, event_queue, session_id
-                        )
-                    return
-                except ImportError:
-                    logger.debug("openinference.instrumentation not available")
-
-            await self._execute_with_error_handling(
-                user_message, event_queue, session_id
-            )
+            await self._execute_with_tracing(user_message, event_queue, session_id)
         except Exception as e:
             logger.exception("Agent execution failed: %s", e)
             await event_queue.enqueue_event(
                 new_agent_text_message(f"Error: {str(e)}")
             )
 
-    async def _execute_with_error_handling(
+    async def _execute_with_tracing(
         self,
         message: str,
         event_queue: EventQueue,
         session_id: str = None,
     ) -> None:
-        """Execute agent with proper error handling.
+        """Execute agent with OpenTelemetry tracing.
 
-        Args:
-            message: User message.
-            event_queue: Event queue for responses.
-            session_id: Optional session ID for trace grouping.
+        Creates a clean root span with user-friendly name and OpenInference
+        attributes for better Phoenix display. This span becomes the primary
+        trace root, replacing the verbose A2A SDK span names.
+        """
+        # Use server_name for root span (distinguishes from LangGraph agent name)
+        # Falls back to agent name if server_name not provided
+        agent_name = getattr(self.agent, "name", "MaskAgent")
+        span_name = self.server_name or agent_name
+
+        try:
+            from opentelemetry import trace
+            from opentelemetry.context import Context
+
+            tracer = trace.get_tracer("mask.a2a")
+
+            # Create a NEW root span by passing empty context (no parent)
+            # This breaks the link to A2A's parent span, making ours the root
+            with tracer.start_as_current_span(
+                name=span_name,
+                context=Context(),  # Empty context = no parent = root span
+                attributes={
+                    "input.value": message,
+                    "input.mime_type": "text/plain",
+                    "mask.agent.name": agent_name,
+                    "mask.server.name": span_name,
+                    "openinference.span.kind": "AGENT",
+                },
+            ) as span:
+                # Set session.id for Phoenix session linking
+                if session_id:
+                    span.set_attribute("session.id", session_id)
+
+                # Execute with session context for child spans
+                if session_id:
+                    try:
+                        from openinference.instrumentation import using_session
+
+                        with using_session(session_id):
+                            response_text = await self._execute_and_capture(
+                                message, event_queue, session_id
+                            )
+                    except ImportError:
+                        response_text = await self._execute_and_capture(
+                            message, event_queue, session_id
+                        )
+                else:
+                    response_text = await self._execute_and_capture(
+                        message, event_queue, session_id
+                    )
+
+                # Set output after execution
+                if response_text:
+                    span.set_attribute("output.value", response_text)
+                    span.set_attribute("output.mime_type", "text/plain")
+
+        except ImportError:
+            logger.debug("OpenTelemetry not available, executing without tracing")
+            await self._execute_and_capture(message, event_queue, session_id)
+        except Exception as e:
+            logger.warning("Tracing setup failed: %s, executing without tracing", e)
+            await self._execute_and_capture(message, event_queue, session_id)
+
+    async def _execute_and_capture(
+        self,
+        message: str,
+        event_queue: EventQueue,
+        session_id: str = None,
+    ) -> str:
+        """Execute agent and capture the response text.
+
+        Returns:
+            The response text from the agent.
         """
         if self.stream:
-            await self._execute_streaming(message, event_queue, session_id)
+            return await self._execute_streaming_capture(message, event_queue, session_id)
         else:
-            await self._execute_non_streaming(message, event_queue, session_id)
+            return await self._execute_non_streaming_capture(message, event_queue, session_id)
 
-    async def _execute_non_streaming(
+    async def _execute_non_streaming_capture(
         self,
         message: str,
         event_queue: EventQueue,
         session_id: str = None,
-    ) -> None:
-        """Execute agent without streaming.
-
-        Args:
-            message: User message.
-            event_queue: Event queue for responses.
-            session_id: Optional session ID for trace grouping.
-        """
+    ) -> str:
+        """Execute agent without streaming and capture response."""
         response = await self.agent.invoke(message, session_id=session_id)
-        await event_queue.enqueue_event(
-            new_agent_text_message(response)
-        )
+        await event_queue.enqueue_event(new_agent_text_message(response))
+        return response
 
-    async def _execute_streaming(
+    async def _execute_streaming_capture(
         self,
         message: str,
         event_queue: EventQueue,
         session_id: str = None,
-    ) -> None:
-        """Execute agent with streaming.
-
-        Args:
-            message: User message.
-            event_queue: Event queue for responses.
-            session_id: Optional session ID for trace grouping.
-        """
+    ) -> str:
+        """Execute agent with streaming and capture response."""
         full_response = ""
         async for chunk in self.agent.stream(message, session_id=session_id):
             full_response += chunk
-            # Note: A2A streaming events could be sent here
-            # For now, we collect and send final response
-
-        await event_queue.enqueue_event(
-            new_agent_text_message(full_response)
-        )
+        await event_queue.enqueue_event(new_agent_text_message(full_response))
+        return full_response
 
     def _extract_user_message(self, context: RequestContext) -> str:
         """Extract text message from A2A request context.
