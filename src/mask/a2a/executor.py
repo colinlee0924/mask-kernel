@@ -80,29 +80,59 @@ class MaskAgentExecutor(AgentExecutor):
             session_id or "none",
         )
 
-        # Set session context at executor level so root span gets session.id
-        # Phoenix only recognizes session.id on root spans (parent is null)
+        # Create a root span with session.id for Phoenix session tracking
+        # Phoenix requires session.id on root spans (parent is null) for "View Trace" to work
         try:
-            if session_id:
-                try:
-                    from openinference.instrumentation import using_session
-
-                    with using_session(session_id):
-                        await self._execute_with_error_handling(
-                            user_message, event_queue, session_id
-                        )
-                    return
-                except ImportError:
-                    pass
-
-            # No session or using_session not available
-            await self._execute_with_error_handling(
+            await self._execute_with_tracing(
                 user_message, event_queue, session_id
             )
         except Exception as e:
             logger.exception("Agent execution failed: %s", e)
             await event_queue.enqueue_event(
                 new_agent_text_message(f"Error: {str(e)}")
+            )
+
+    async def _execute_with_tracing(
+        self,
+        message: str,
+        event_queue: EventQueue,
+        session_id: str = None,
+    ) -> None:
+        """Execute agent with OpenTelemetry tracing and session context.
+
+        Creates a root span with session.id attribute for Phoenix session tracking.
+        """
+        try:
+            from opentelemetry import trace
+
+            tracer = trace.get_tracer(__name__)
+
+            # Create root span with session.id attribute
+            span_name = f"{self.agent.name}" if hasattr(self.agent, 'name') else "agent"
+            with tracer.start_as_current_span(span_name) as span:
+                if session_id:
+                    # Set session.id as span attribute for Phoenix
+                    span.set_attribute("session.id", session_id)
+
+                # Also use using_session for child span propagation
+                if session_id:
+                    try:
+                        from openinference.instrumentation import using_session
+                        with using_session(session_id):
+                            await self._execute_with_error_handling(
+                                message, event_queue, session_id
+                            )
+                        return
+                    except ImportError:
+                        pass
+
+                await self._execute_with_error_handling(
+                    message, event_queue, session_id
+                )
+        except ImportError:
+            # OpenTelemetry not available, execute without tracing wrapper
+            await self._execute_with_error_handling(
+                message, event_queue, session_id
             )
 
     async def _execute_with_error_handling(
