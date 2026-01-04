@@ -156,6 +156,25 @@ class SkillRegistry:
                 tools.append(loader_tool)
         return tools
 
+    def get_all_tools(self) -> List[BaseTool]:
+        """Get all tools from all registered skills.
+
+        This returns both loader tools AND capability tools for all skills.
+        Used when initializing agents with create_agent() - the middleware
+        will handle filtering based on skills_loaded state.
+
+        Returns:
+            List of all tools from all registered skills.
+        """
+        tools: List[BaseTool] = []
+        for skill in self._skills.values():
+            if skill.metadata.enabled:
+                # Add loader tool
+                tools.append(skill.get_loader_tool())
+                # Add all capability tools
+                tools.extend(skill.get_tools())
+        return tools
+
     def get_tools_for_active_skills(
         self,
         active_skills: List[str],

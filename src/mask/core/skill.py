@@ -4,12 +4,18 @@ This module defines the base classes and data structures for skills:
 - SkillMetadata: Metadata for a skill (name, description, version, etc.)
 - BaseSkill: Abstract base class for all skills
 - MarkdownSkill: Skill loaded from SKILL.md files
+
+Loader tools now return LangGraph Command objects to trigger state updates
+for Progressive Disclosure. When a loader tool is called:
+1. It returns Command(update={"skills_loaded": [skill_name], "messages": [...]})
+2. LangGraph updates the state with the new skills_loaded
+3. The middleware sees the updated state and exposes the skill's tools
 """
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 if TYPE_CHECKING:
     from langchain_core.tools import BaseTool
@@ -170,24 +176,44 @@ class MarkdownSkill(BaseSkill):
     def get_loader_tool(self) -> "BaseTool":
         """Return the loader tool for this skill.
 
-        The loader tool returns the skill's instructions when called.
+        The loader tool returns a Command that:
+        1. Updates skills_loaded state to activate this skill
+        2. Returns the skill's instructions as a ToolMessage
         """
-        from langchain_core.tools import StructuredTool
+        from langchain_core.tools import tool
 
         skill_name = self.metadata.name
-        instructions = self._instructions
+        skill_instance = self
 
-        def loader() -> str:
+        @tool(name=f"use_{skill_name.replace('-', '_')}")
+        def loader(runtime: Any = None) -> Any:
             """Load and activate this skill."""
-            return instructions
+            from langchain_core.messages import ToolMessage
+            from langgraph.types import Command
 
-        # Create tool with custom name using StructuredTool
-        tool_name = f"use_{skill_name.replace('-', '_')}"
-        return StructuredTool.from_function(
-            func=loader,
-            name=tool_name,
-            description=f"Activate the {skill_name} skill. {self.metadata.description}",
+            instructions = skill_instance.get_instructions()
+
+            # Get tool_call_id from runtime if available
+            tool_call_id = "unknown"
+            if runtime is not None and hasattr(runtime, "tool_call_id"):
+                tool_call_id = runtime.tool_call_id
+
+            return Command(
+                update={
+                    "messages": [
+                        ToolMessage(
+                            content=instructions,
+                            tool_call_id=tool_call_id,
+                        )
+                    ],
+                    "skills_loaded": [skill_name],
+                }
+            )
+
+        loader.description = (
+            f"Activate the {skill_name} skill. {self.metadata.description}"
         )
+        return loader
 
     def get_instructions(self) -> str:
         """Return the full instructions from SKILL.md."""
