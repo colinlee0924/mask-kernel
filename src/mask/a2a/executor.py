@@ -2,16 +2,22 @@
 
 This module bridges MASK BaseAgent to A2A AgentExecutor interface,
 following patterns from a2a-python-samples.
+
+Supports multi-agent handoffs with context isolation:
+- HandoffContext for passing initial_skills and context_data
+- Task-scoped sessions for agent coordination
+- Parent-child relationship tracking for observability
 """
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.types import TaskState, TaskStatus
 from a2a.utils import new_agent_text_message
 
+from mask.core.state import HandoffContext
 from mask.observability.attributes import (
     set_span_io,
     set_span_metadata,
@@ -84,16 +90,22 @@ class MaskAgentExecutor(AgentExecutor):
         # Extract session ID for observability trace grouping
         session_id = self._extract_session_id(context)
 
+        # Extract handoff context for multi-agent coordination
+        handoff_context = self._extract_handoff_context(context)
+
         logger.debug(
-            "Executing agent with message: %s... (session: %s)",
+            "Executing agent with message: %s... (session: %s, handoff: %s)",
             user_message[:50],
             session_id or "none",
+            handoff_context.parent_agent if handoff_context else "none",
         )
 
         # Create a user-friendly root span for Phoenix display
         # This wraps the A2A infrastructure spans with a readable agent name
         try:
-            await self._execute_with_tracing(user_message, event_queue, session_id)
+            await self._execute_with_tracing(
+                user_message, event_queue, session_id, handoff_context
+            )
         except Exception as e:
             logger.exception("Agent execution failed: %s", e)
             await event_queue.enqueue_event(
@@ -104,7 +116,8 @@ class MaskAgentExecutor(AgentExecutor):
         self,
         message: str,
         event_queue: EventQueue,
-        session_id: str = None,
+        session_id: Optional[str] = None,
+        handoff_context: Optional[HandoffContext] = None,
     ) -> None:
         """Execute agent with OpenTelemetry tracing.
 
@@ -124,14 +137,30 @@ class MaskAgentExecutor(AgentExecutor):
 
             tracer = trace.get_tracer("mask.a2a")
 
+            # Build span attributes
+            span_attributes: Dict[str, Any] = {
+                "openinference.span.kind": "AGENT",
+            }
+
+            # Add handoff context attributes for tracing
+            if handoff_context:
+                if handoff_context.parent_agent:
+                    span_attributes["mask.handoff.parent_agent"] = (
+                        handoff_context.parent_agent
+                    )
+                if handoff_context.task_id:
+                    span_attributes["mask.handoff.task_id"] = handoff_context.task_id
+                if handoff_context.initial_skills:
+                    span_attributes["mask.handoff.initial_skills"] = ",".join(
+                        handoff_context.initial_skills
+                    )
+
             # Create a NEW root span by passing empty context (no parent)
             # This breaks the link to A2A's parent span, making ours the root
             with tracer.start_as_current_span(
                 name=span_name,
                 context=Context(),  # Empty context = no parent = root span
-                attributes={
-                    "openinference.span.kind": "AGENT",
-                },
+                attributes=span_attributes,
             ) as span:
                 # Use multi-backend attribute utilities for compatibility
                 # with Phoenix, Langfuse, and OpenTelemetry GenAI
@@ -146,15 +175,15 @@ class MaskAgentExecutor(AgentExecutor):
 
                         with using_session(session_id):
                             response_text = await self._execute_and_capture(
-                                message, event_queue, session_id
+                                message, event_queue, session_id, handoff_context
                             )
                     except ImportError:
                         response_text = await self._execute_and_capture(
-                            message, event_queue, session_id
+                            message, event_queue, session_id, handoff_context
                         )
                 else:
                     response_text = await self._execute_and_capture(
-                        message, event_queue, session_id
+                        message, event_queue, session_id, handoff_context
                     )
 
                 # Set output after execution (multi-backend compatible)
@@ -163,16 +192,21 @@ class MaskAgentExecutor(AgentExecutor):
 
         except ImportError:
             logger.debug("OpenTelemetry not available, executing without tracing")
-            await self._execute_and_capture(message, event_queue, session_id)
+            await self._execute_and_capture(
+                message, event_queue, session_id, handoff_context
+            )
         except Exception as e:
             logger.warning("Tracing setup failed: %s, executing without tracing", e)
-            await self._execute_and_capture(message, event_queue, session_id)
+            await self._execute_and_capture(
+                message, event_queue, session_id, handoff_context
+            )
 
     async def _execute_and_capture(
         self,
         message: str,
         event_queue: EventQueue,
-        session_id: str = None,
+        session_id: Optional[str] = None,
+        handoff_context: Optional[HandoffContext] = None,
     ) -> str:
         """Execute agent and capture the response text.
 
@@ -180,18 +214,25 @@ class MaskAgentExecutor(AgentExecutor):
             The response text from the agent.
         """
         if self.stream:
-            return await self._execute_streaming_capture(message, event_queue, session_id)
+            return await self._execute_streaming_capture(
+                message, event_queue, session_id, handoff_context
+            )
         else:
-            return await self._execute_non_streaming_capture(message, event_queue, session_id)
+            return await self._execute_non_streaming_capture(
+                message, event_queue, session_id, handoff_context
+            )
 
     async def _execute_non_streaming_capture(
         self,
         message: str,
         event_queue: EventQueue,
-        session_id: str = None,
+        session_id: Optional[str] = None,
+        handoff_context: Optional[HandoffContext] = None,
     ) -> str:
         """Execute agent without streaming and capture response."""
-        response = await self.agent.invoke(message, session_id=session_id)
+        response = await self.agent.invoke(
+            message, session_id=session_id, handoff_context=handoff_context
+        )
         await event_queue.enqueue_event(new_agent_text_message(response))
         return response
 
@@ -199,11 +240,14 @@ class MaskAgentExecutor(AgentExecutor):
         self,
         message: str,
         event_queue: EventQueue,
-        session_id: str = None,
+        session_id: Optional[str] = None,
+        handoff_context: Optional[HandoffContext] = None,
     ) -> str:
         """Execute agent with streaming and capture response."""
         full_response = ""
-        async for chunk in self.agent.stream(message, session_id=session_id):
+        async for chunk in self.agent.stream(
+            message, session_id=session_id, handoff_context=handoff_context
+        ):
             full_response += chunk
         await event_queue.enqueue_event(new_agent_text_message(full_response))
         return full_response
@@ -228,7 +272,7 @@ class MaskAgentExecutor(AgentExecutor):
 
         return ""
 
-    def _extract_session_id(self, context: RequestContext) -> str | None:
+    def _extract_session_id(self, context: RequestContext) -> Optional[str]:
         """Extract session ID from A2A request context.
 
         A2A uses context_id (contextId in JSON) as the session/conversation identifier.
@@ -249,6 +293,49 @@ class MaskAgentExecutor(AgentExecutor):
         # Fallback: check RequestContext for context_id
         if hasattr(context, "context_id") and context.context_id:
             return context.context_id
+
+        return None
+
+    def _extract_handoff_context(
+        self, context: RequestContext
+    ) -> Optional[HandoffContext]:
+        """Extract handoff context from A2A request context.
+
+        Handoff context is passed via A2A message metadata for multi-agent
+        coordination. It allows parent agents to:
+        - Pre-activate skills in child agents (initial_skills)
+        - Pass task-specific data without polluting conversation (context_data)
+        - Track parent-child relationships (parent_agent, task_id)
+
+        Args:
+            context: The request context.
+
+        Returns:
+            HandoffContext if found, None otherwise.
+        """
+        message = context.message
+        if not message:
+            return None
+
+        # Check message metadata for handoff context
+        # A2A supports metadata field on messages
+        metadata: Optional[Dict[str, Any]] = None
+        if hasattr(message, "metadata") and message.metadata:
+            metadata = message.metadata
+        elif hasattr(message, "root") and hasattr(message.root, "metadata"):
+            metadata = message.root.metadata
+
+        if not metadata:
+            return None
+
+        # Extract handoff context from metadata
+        handoff_data = metadata.get("handoff_context") or metadata.get("handoff")
+        if not handoff_data:
+            return None
+
+        # Parse handoff context
+        if isinstance(handoff_data, dict):
+            return HandoffContext.from_dict(handoff_data)
 
         return None
 

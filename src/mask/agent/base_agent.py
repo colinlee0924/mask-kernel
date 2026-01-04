@@ -8,8 +8,17 @@ Key features:
 - Stateless by default (stateless=True)
 - Optional session persistence for stateful operation
 - Integration with SkillRegistry for Progressive Disclosure
-- LangGraph-based execution with create_react_agent
+- LangGraph-based execution with LangChain 1.x create_agent
 - Built-in observability via Langfuse callbacks with proper trace hierarchy
+- AgentMiddleware support for dynamic tool filtering (Progressive Disclosure)
+
+Progressive Disclosure Flow:
+1. Agent starts with only loader tools visible
+2. User asks to use a skill -> Agent calls use_<skill> loader tool
+3. Loader returns Command(update={"skills_loaded": [skill_name]})
+4. LangGraph updates state
+5. Next model call -> SkillMiddleware filters tools based on new state
+6. Now skill's capability tools are visible
 """
 
 import logging
@@ -21,7 +30,15 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.tools import BaseTool
 
 from mask.core.registry import SkillRegistry
-from mask.core.state import SkillState
+from mask.core.state import (
+    HandoffContext,
+    SkillState,
+    SkillStateFIFO,
+    SkillStateMode,
+    SkillStateReplace,
+    StateScope,
+    create_fifo_state,
+)
 from mask.middleware.skill_middleware import SkillMiddleware
 from mask.session.session import Session
 from mask.storage.base import SessionStore
@@ -65,10 +82,13 @@ class BaseAgent(ABC):
         *,
         name: Optional[str] = None,
         stateless: bool = True,
+        state_scope: StateScope = StateScope.REQUEST,
         session_store: Optional[SessionStore] = None,
         additional_tools: Optional[List[BaseTool]] = None,
         middleware: Optional[SkillMiddleware] = None,
         enable_observability: bool = True,
+        skill_state_mode: SkillStateMode = SkillStateMode.ACCUMULATE,
+        fifo_max_skills: int = 3,
     ) -> None:
         """Initialize the base agent.
 
@@ -77,36 +97,67 @@ class BaseAgent(ABC):
             skill_registry: Optional skill registry for Progressive Disclosure.
             system_prompt: The system prompt for the agent.
             name: Agent name for observability traces. If not provided, uses class name.
-            stateless: If True (default), no session state is maintained.
-            session_store: Storage backend for sessions. Required for stateful.
+            stateless: If True (default), no session state is maintained between invokes.
+                Note: Progressive Disclosure works within single invoke() via LangGraph
+                state, regardless of this setting.
+            state_scope: State persistence scope (NONE/REQUEST/TASK/CONVERSATION).
+                - NONE: No state (pure stateless, no Progressive Disclosure)
+                - REQUEST: State within single invoke() - default, enables Progressive Disclosure
+                - TASK: State within task/handoff chain (multi-agent)
+                - CONVERSATION: Full session persistence
+            session_store: Storage backend for sessions. Required for CONVERSATION scope.
             additional_tools: Non-skill tools to always include.
             middleware: Custom skill middleware. Created automatically if not provided.
             enable_observability: If True (default), auto-detect and use Langfuse tracing.
+            skill_state_mode: How skills_loaded state is managed (REPLACE/ACCUMULATE/FIFO).
+            fifo_max_skills: Max concurrent skills when using FIFO mode.
         """
         self.model = model
         self.skill_registry = skill_registry or SkillRegistry()
         self.system_prompt = system_prompt
         self.name = name or self.__class__.__name__
         self.stateless = stateless
+        self.state_scope = state_scope
         self.additional_tools = additional_tools or []
         self.enable_observability = enable_observability
+        self.skill_state_mode = skill_state_mode
+        self.fifo_max_skills = fifo_max_skills
 
-        # Session store setup
-        if not stateless:
+        # Session store setup - needed for TASK and CONVERSATION scopes
+        if state_scope in (StateScope.TASK, StateScope.CONVERSATION) or not stateless:
             self._session_store = session_store or MemorySessionStore()
         else:
             self._session_store = None
 
-        # Middleware setup
-        self.middleware = middleware or SkillMiddleware(self.skill_registry)
+        # Middleware setup with additional_tools for filtering
+        self.middleware = middleware or SkillMiddleware(
+            self.skill_registry,
+            additional_tools=self.additional_tools,
+            verbose=True,
+        )
 
         logger.debug(
-            "Initialized BaseAgent: name=%s, stateless=%s, skills=%d, observability=%s",
+            "Initialized BaseAgent: name=%s, stateless=%s, scope=%s, skills=%d, "
+            "state_mode=%s, observability=%s",
             self.name,
             stateless,
+            state_scope.value,
             len(self.skill_registry),
+            skill_state_mode.value,
             enable_observability,
         )
+
+    def _get_state_schema(self) -> type:
+        """Get the appropriate state schema based on skill_state_mode.
+
+        Returns:
+            State class (SkillState, SkillStateReplace, or SkillStateFIFO).
+        """
+        if self.skill_state_mode == SkillStateMode.REPLACE:
+            return SkillStateReplace
+        elif self.skill_state_mode == SkillStateMode.FIFO:
+            return create_fifo_state(self.fifo_max_skills)
+        return SkillState  # Default: Accumulate
 
     def _get_callbacks(self, session_id: Optional[str] = None) -> List[Any]:
         """Get callback handlers for model invocation.
@@ -141,12 +192,15 @@ class BaseAgent(ABC):
         self,
         message: str,
         session_id: Optional[str] = None,
+        handoff_context: Optional[HandoffContext] = None,
     ) -> str:
         """Process a single message and return the response.
 
         Args:
             message: The user message to process.
             session_id: Optional session ID for stateful operation.
+            handoff_context: Optional context from parent agent (multi-agent handoff).
+                Contains initial_skills to pre-activate and context_data.
 
         Returns:
             The agent's response as a string.
@@ -158,12 +212,15 @@ class BaseAgent(ABC):
         self,
         message: str,
         session_id: Optional[str] = None,
+        handoff_context: Optional[HandoffContext] = None,
     ) -> AsyncIterator[str]:
         """Process a message and stream the response.
 
         Args:
             message: The user message to process.
             session_id: Optional session ID for stateful operation.
+            handoff_context: Optional context from parent agent (multi-agent handoff).
+                Contains initial_skills to pre-activate and context_data.
 
         Yields:
             Response chunks as strings.
@@ -197,19 +254,30 @@ class BaseAgent(ABC):
         self,
         messages: Sequence[BaseMessage],
         skills_loaded: Optional[List[str]] = None,
+        handoff_context: Optional[HandoffContext] = None,
     ) -> SkillState:
-        """Build agent state from messages and skills.
+        """Build agent state from messages, skills, and handoff context.
 
         Args:
             messages: Conversation messages.
             skills_loaded: List of active skill names.
+            handoff_context: Optional handoff context from parent agent.
 
         Returns:
             SkillState dictionary.
         """
+        # Start with skills from session or empty
+        active_skills = list(skills_loaded or [])
+
+        # Merge initial_skills from handoff context (if any)
+        if handoff_context and handoff_context.initial_skills:
+            for skill in handoff_context.initial_skills:
+                if skill not in active_skills:
+                    active_skills.append(skill)
+
         return {
             "messages": list(messages),
-            "skills_loaded": skills_loaded or [],
+            "skills_loaded": active_skills,
         }
 
     def _get_tools(self, state: SkillState) -> List[BaseTool]:
@@ -242,37 +310,66 @@ class BaseAgent(ABC):
         return list(state.get("messages", []))
 
 
-def _default_agent_factory(model, tools, system_prompt):
-    """Default agent factory using LangChain v1.x create_agent.
+def _default_agent_factory(
+    model,
+    tools,
+    system_prompt,
+    middleware=None,
+    state_schema=None,
+):
+    """Default agent factory using LangChain v1.x create_agent with middleware.
 
     Args:
         model: The LLM model.
         tools: List of tools for the agent.
         system_prompt: System prompt for the agent.
+        middleware: Optional list of AgentMiddleware for dynamic tool filtering.
+        state_schema: Optional state schema for skill tracking.
 
     Returns:
         Agent instance (LangGraph-based).
     """
     from langchain.agents import create_agent
 
-    return create_agent(model, tools=tools, system_prompt=system_prompt)
+    # Build kwargs for create_agent
+    kwargs: Dict[str, Any] = {
+        "tools": tools,
+        "system_prompt": system_prompt,
+    }
+
+    # Add middleware if provided and supported
+    if middleware:
+        kwargs["middleware"] = middleware
+
+    # Add state_schema if provided and supported
+    if state_schema:
+        kwargs["state_schema"] = state_schema
+
+    try:
+        return create_agent(model, **kwargs)
+    except TypeError as e:
+        # Fallback for versions that don't support all kwargs
+        logger.warning("Falling back to simplified agent creation: %s", e)
+        return create_agent(model, tools=tools, system_prompt=system_prompt)
 
 
 class SimpleAgent(BaseAgent):
     """Simple agent implementation with pluggable agent factory.
 
-    By default uses LangChain v1.x create_agent. You can pass a custom
-    agent_factory to use different agent implementations (e.g., deepagents).
+    By default uses LangChain v1.x create_agent with SkillMiddleware for
+    Progressive Disclosure. The middleware dynamically filters tools
+    based on skills_loaded state.
 
     Observability (Phoenix/Langfuse) is handled uniformly by mask-kernel.
     Developers only need to configure .env (project, api-key, baseurl).
 
     Example:
-        # Default: LangChain create_agent
+        # Default: LangChain create_agent with Progressive Disclosure
         agent = SimpleAgent(
             model=factory.get_model(tier=ModelTier.THINKING),
             name="my-agent",
             system_prompt="You are a helpful assistant.",
+            skill_registry=registry,  # Skills discovered here
         )
 
         # Custom: Using deepagents
@@ -294,7 +391,7 @@ class SimpleAgent(BaseAgent):
 
         Args:
             agent_factory: Custom agent factory function. Signature:
-                (model, tools, system_prompt) -> Agent
+                (model, tools, system_prompt, middleware, state_schema) -> Agent
                 Defaults to LangChain v1.x create_agent.
         """
         super().__init__(*args, **kwargs)
@@ -302,26 +399,49 @@ class SimpleAgent(BaseAgent):
         self.agent_factory = agent_factory or _default_agent_factory
 
     def _get_graph(self, tools: List[BaseTool]) -> Any:
-        """Create agent using the configured factory.
+        """Create agent using the configured factory with middleware.
+
+        For Progressive Disclosure, we pass ALL tools to create_agent.
+        The SkillMiddleware.wrap_model_call() will dynamically filter
+        which tools are visible on each model invocation.
 
         Args:
             tools: List of tools for the agent.
 
         Returns:
-            Agent instance.
+            Agent instance with middleware support.
         """
-        return self.agent_factory(self.model, tools, self.system_prompt)
+        # Get all tools from registry (not filtered)
+        # Middleware will handle filtering dynamically
+        all_tools = self.skill_registry.get_all_tools()
+        all_tools.extend(self.additional_tools)
+
+        # Get state schema based on skill_state_mode
+        state_schema = self._get_state_schema()
+
+        # Build middleware list
+        middleware_list = [self.middleware] if self.middleware else []
+
+        return self.agent_factory(
+            self.model,
+            all_tools,
+            self.system_prompt,
+            middleware=middleware_list if middleware_list else None,
+            state_schema=state_schema,
+        )
 
     async def invoke(
         self,
         message: str,
         session_id: Optional[str] = None,
+        handoff_context: Optional[HandoffContext] = None,
     ) -> str:
         """Process a message and return the response.
 
         Args:
             message: The user message.
             session_id: Optional session ID.
+            handoff_context: Optional context from parent agent (multi-agent handoff).
 
         Returns:
             The agent's response.
@@ -335,9 +455,9 @@ class SimpleAgent(BaseAgent):
             messages = list(session.messages)
         messages.append(HumanMessage(content=message))
 
-        # Build state
+        # Build state with handoff context
         skills_loaded = session.skills_loaded if session else []
-        state = self._build_state(messages, skills_loaded)
+        state = self._build_state(messages, skills_loaded, handoff_context)
 
         # Get tools
         tools = self._get_tools(state)
@@ -354,6 +474,10 @@ class SimpleAgent(BaseAgent):
             config["configurable"] = {"thread_id": session_id}
             # Note: session.id is set at executor level via using_session()
             # Do NOT set session.id in metadata - it interferes with Phoenix tracking
+
+        # Add handoff context to config for tracing
+        if handoff_context:
+            config.setdefault("metadata", {})["handoff"] = handoff_context.to_dict()
 
         # Always use LangGraph agent (create_agent) for proper trace structure
         # Even with empty tools, this ensures Phoenix/Langfuse see full execution details:
@@ -400,12 +524,14 @@ class SimpleAgent(BaseAgent):
         self,
         message: str,
         session_id: Optional[str] = None,
+        handoff_context: Optional[HandoffContext] = None,
     ) -> AsyncIterator[str]:
         """Stream the response.
 
         Args:
             message: The user message.
             session_id: Optional session ID.
+            handoff_context: Optional context from parent agent (multi-agent handoff).
 
         Yields:
             Response chunks.
@@ -419,9 +545,9 @@ class SimpleAgent(BaseAgent):
             messages = list(session.messages)
         messages.append(HumanMessage(content=message))
 
-        # Build state
+        # Build state with handoff context
         skills_loaded = session.skills_loaded if session else []
-        state = self._build_state(messages, skills_loaded)
+        state = self._build_state(messages, skills_loaded, handoff_context)
 
         # Get tools
         tools = self._get_tools(state)
@@ -438,6 +564,10 @@ class SimpleAgent(BaseAgent):
             config["configurable"] = {"thread_id": session_id}
             # Note: session.id is set at executor level via using_session()
             # Do NOT set session.id in metadata - it interferes with Phoenix tracking
+
+        # Add handoff context to config for tracing
+        if handoff_context:
+            config.setdefault("metadata", {})["handoff"] = handoff_context.to_dict()
 
         # Always use LangGraph agent (create_agent) for proper trace structure
         full_response = ""

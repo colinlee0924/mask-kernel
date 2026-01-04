@@ -1,16 +1,23 @@
 """Skill Middleware for Progressive Disclosure.
 
 This module implements the middleware layer that enables Progressive Disclosure
-of skills in the MASK framework.
+of skills in the MASK framework using LangChain 1.x AgentMiddleware.
 
 Key responsibilities:
-1. Inject skill metadata into system prompts
-2. Filter available tools based on active skills
-3. Handle skill activation through loader tools
+1. Intercept each model call via wrap_model_call()
+2. Dynamically filter tools based on skills_loaded state
+3. Inject skill metadata into system prompts
 
-The middleware intercepts model calls and:
-- Prepends skill information to the system prompt
-- Filters tools to show loader tools + active skill tools
+The middleware uses request.override(tools=...) to dynamically change
+which tools the model sees on each invocation. This enables true Progressive
+Disclosure within a single invoke() call.
+
+When a loader tool is called:
+1. It returns a Command with skills_loaded update
+2. The state is updated by LangGraph
+3. Next model call goes through wrap_model_call() again
+4. Middleware filters tools based on new skills_loaded
+5. Model now sees the newly activated skill's tools
 """
 
 import logging
@@ -18,6 +25,21 @@ from typing import Any, Callable, List, Optional, Sequence
 
 from langchain_core.messages import BaseMessage, SystemMessage
 from langchain_core.tools import BaseTool
+
+try:
+    from langchain.agents.middleware import (
+        AgentMiddleware,
+        ModelRequest,
+        ModelResponse,
+    )
+
+    HAS_AGENT_MIDDLEWARE = True
+except ImportError:
+    # Fallback for older LangChain versions
+    HAS_AGENT_MIDDLEWARE = False
+    AgentMiddleware = object
+    ModelRequest = Any
+    ModelResponse = Any
 
 from mask.core.registry import SkillRegistry
 from mask.core.state import SkillState
@@ -142,28 +164,41 @@ def filter_tools_for_state(
     return all_tools
 
 
-class SkillMiddleware:
+class SkillMiddleware(AgentMiddleware if HAS_AGENT_MIDDLEWARE else object):
     """Middleware for Progressive Disclosure of skills.
 
-    This middleware wraps model calls to:
-    1. Inject skill metadata into system prompts
-    2. Filter available tools based on active skills
+    Implements LangChain 1.x AgentMiddleware to intercept each model call
+    and dynamically filter tools based on skills_loaded state.
+
+    Key method: wrap_model_call()
+    - Called before each model invocation
+    - Reads skills_loaded from request.state
+    - Filters tools via registry.get_tools_for_active_skills()
+    - Uses request.override(tools=...) to replace tool list
+    - Calls handler(filtered_request) to continue
+
+    This enables true Progressive Disclosure within a single invoke():
+    1. Initial call: only loader tools visible
+    2. Agent calls use_calculator → returns Command with skills_loaded update
+    3. State updated, next model call triggers wrap_model_call again
+    4. Now calculator tools are visible
 
     Usage:
         middleware = SkillMiddleware(registry)
-
-        # In your agent graph node
-        def call_model(state: SkillState):
-            messages = middleware.prepare_messages(state)
-            tools = middleware.get_tools(state, additional_tools=[...])
-            response = model.bind_tools(tools).invoke(messages)
-            return {"messages": [response]}
+        agent = create_agent(
+            model=model,
+            tools=all_tools,
+            middleware=[middleware],
+            state_schema=SkillState,
+        )
     """
 
     def __init__(
         self,
         registry: SkillRegistry,
         include_skill_instructions: bool = True,
+        verbose: bool = False,
+        additional_tools: Optional[List[BaseTool]] = None,
     ) -> None:
         """Initialize the middleware.
 
@@ -171,9 +206,107 @@ class SkillMiddleware:
             registry: Skill registry for tool management.
             include_skill_instructions: Whether to include skill instructions
                 in the system prompt when skills are active.
+            verbose: Whether to log tool filtering details.
+            additional_tools: Non-skill tools to always include.
         """
+        if HAS_AGENT_MIDDLEWARE:
+            super().__init__()
         self.registry = registry
         self.include_skill_instructions = include_skill_instructions
+        self.verbose = verbose
+        self.additional_tools = additional_tools or []
+
+    # =========================================================================
+    # AgentMiddleware Implementation (LangChain 1.x)
+    # =========================================================================
+
+    def wrap_model_call(
+        self,
+        request: "ModelRequest",
+        handler: Callable[["ModelRequest"], "ModelResponse"],
+    ) -> "ModelResponse":
+        """Intercept model call and dynamically filter tools.
+
+        This is the core method for Progressive Disclosure. It:
+        1. Reads skills_loaded from request.state
+        2. Gets filtered tools from registry
+        3. Overrides the request's tools
+        4. Passes to next handler
+
+        Args:
+            request: Model request with state and tools.
+            handler: Next handler in the chain.
+
+        Returns:
+            Model response from the handler.
+        """
+        # Extract skills_loaded from state
+        skills_loaded = self._get_skills_loaded(request)
+
+        # Get filtered tools (loaders + active skill capability tools)
+        relevant_tools = self.registry.get_tools_for_active_skills(skills_loaded)
+
+        # Add additional non-skill tools
+        if self.additional_tools:
+            relevant_tools = list(relevant_tools) + list(self.additional_tools)
+
+        if self.verbose:
+            logger.info("[SkillMiddleware] skills_loaded: %s", skills_loaded)
+            logger.info(
+                "[SkillMiddleware] tools (%d): %s",
+                len(relevant_tools),
+                [t.name for t in relevant_tools],
+            )
+
+        # Override tools in request
+        filtered_request = request.override(tools=relevant_tools)
+
+        # Call next handler
+        return handler(filtered_request)
+
+    async def awrap_model_call(
+        self,
+        request: "ModelRequest",
+        handler: Callable[["ModelRequest"], "ModelResponse"],
+    ) -> "ModelResponse":
+        """Async version of wrap_model_call."""
+        skills_loaded = self._get_skills_loaded(request)
+        relevant_tools = self.registry.get_tools_for_active_skills(skills_loaded)
+
+        if self.additional_tools:
+            relevant_tools = list(relevant_tools) + list(self.additional_tools)
+
+        if self.verbose:
+            logger.info("[SkillMiddleware] (async) skills_loaded: %s", skills_loaded)
+            logger.info(
+                "[SkillMiddleware] (async) tools (%d): %s",
+                len(relevant_tools),
+                [t.name for t in relevant_tools],
+            )
+
+        filtered_request = request.override(tools=relevant_tools)
+        return await handler(filtered_request)
+
+    def _get_skills_loaded(self, request: "ModelRequest") -> List[str]:
+        """Extract skills_loaded from request state.
+
+        Args:
+            request: Model request with state.
+
+        Returns:
+            List of loaded skill names.
+        """
+        skills_loaded = []
+        if hasattr(request, "state") and request.state is not None:
+            if isinstance(request.state, dict):
+                skills_loaded = request.state.get("skills_loaded", [])
+            else:
+                skills_loaded = getattr(request.state, "skills_loaded", [])
+        return skills_loaded
+
+    # =========================================================================
+    # Legacy Methods (for backward compatibility)
+    # =========================================================================
 
     def prepare_messages(
         self,
@@ -254,8 +387,8 @@ def create_loader_tool_with_activation(
     """Create a loader tool that activates the skill and returns instructions.
 
     This creates a tool that when invoked:
-    1. Returns the skill's instructions
-    2. The state update (skill activation) is handled by the agent
+    1. Returns a Command with skills_loaded update
+    2. Returns the skill's instructions as a ToolMessage
 
     Args:
         registry: The skill registry.
@@ -268,15 +401,36 @@ def create_loader_tool_with_activation(
         This is an alternative to using the skill's built-in get_loader_tool().
         Use this when you need custom activation logic.
     """
+    from typing import Any
+
+    from langchain_core.messages import ToolMessage
     from langchain_core.tools import tool
+    from langgraph.types import Command
 
     skill = registry.get(skill_name)
     description = skill.metadata.description
 
     @tool(name=f"use_{skill_name.replace('-', '_')}")
-    def loader() -> str:
+    def loader(runtime: Any = None) -> Command:
         """Activate the skill and get instructions."""
-        return skill.get_instructions()
+        instructions = skill.get_instructions()
+
+        # Get tool_call_id from runtime if available
+        tool_call_id = "unknown"
+        if runtime is not None and hasattr(runtime, "tool_call_id"):
+            tool_call_id = runtime.tool_call_id
+
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=instructions,
+                        tool_call_id=tool_call_id,
+                    )
+                ],
+                "skills_loaded": [skill_name],
+            }
+        )
 
     loader.description = f"Activate the {skill_name} skill. {description}"
     return loader
