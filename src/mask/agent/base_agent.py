@@ -29,6 +29,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.tools import BaseTool
 
+from mask.core.events import AgentEvent
 from mask.core.registry import SkillRegistry
 from mask.core.state import (
     HandoffContext,
@@ -224,6 +225,39 @@ class BaseAgent(ABC):
 
         Yields:
             Response chunks as strings.
+        """
+        pass
+
+    @abstractmethod
+    async def astream_events(
+        self,
+        message: str,
+        session_id: Optional[str] = None,
+        handoff_context: Optional[HandoffContext] = None,
+    ) -> AsyncIterator[AgentEvent]:
+        """Stream structured events during agent execution.
+
+        Unlike stream() which yields text chunks, this method yields
+        structured AgentEvent objects that include tool calls, LLM
+        responses, and agent lifecycle events.
+
+        This enables rich UI rendering with collapsible sections for
+        tool calls and real-time progress indicators.
+
+        Args:
+            message: The user message to process.
+            session_id: Optional session ID for stateful operation.
+            handoff_context: Optional context from parent agent.
+
+        Yields:
+            AgentEvent objects representing execution events.
+
+        Example:
+            async for event in agent.astream_events("List my tickets"):
+                if event.type == "tool_call_start":
+                    print(f"Calling tool: {event.name}")
+                elif event.type == "text_delta":
+                    print(event.data["delta"], end="")
         """
         pass
 
@@ -611,6 +645,137 @@ class SimpleAgent(BaseAgent):
                     content = msg.content
                     if isinstance(content, str):
                         yield content
+
+    async def astream_events(
+        self,
+        message: str,
+        session_id: Optional[str] = None,
+        handoff_context: Optional[HandoffContext] = None,
+    ) -> AsyncIterator[AgentEvent]:
+        """Stream structured events during agent execution.
+
+        Uses LangChain's astream_events() API (v2) to get detailed
+        execution events including tool calls and LLM responses.
+
+        Args:
+            message: The user message.
+            session_id: Optional session ID.
+            handoff_context: Optional context from parent agent.
+
+        Yields:
+            AgentEvent objects for each execution event.
+        """
+        import uuid
+
+        # Get or create session
+        session = await self._get_session(session_id)
+
+        # Build messages
+        messages: List[BaseMessage] = []
+        if session:
+            messages = list(session.messages)
+        messages.append(HumanMessage(content=message))
+
+        # Build state with handoff context
+        skills_loaded = session.skills_loaded if session else []
+        state = self._build_state(messages, skills_loaded, handoff_context)
+
+        # Get tools
+        tools = self._get_tools(state)
+
+        # Get callbacks for observability with session_id
+        callbacks = self._get_callbacks(session_id=session_id)
+        config: Dict[str, Any] = {
+            "callbacks": callbacks,
+            "run_name": self.name,
+        }
+
+        # Add session/thread configuration for LangGraph
+        if session_id:
+            config["configurable"] = {"thread_id": session_id}
+
+        # Add handoff context to config for tracing
+        if handoff_context:
+            config.setdefault("metadata", {})["handoff"] = handoff_context.to_dict()
+
+        # Get graph
+        graph = self._get_graph(tools)
+        full_response = ""
+        run_id = str(uuid.uuid4())
+
+        # Emit agent start event
+        yield AgentEvent.agent_start(name=self.name, run_id=run_id)
+
+        try:
+            # Use LangChain astream_events v2 for structured events
+            async for event in graph.astream_events(
+                {"messages": messages},
+                config=config,
+                version="v2",
+            ):
+                event_type = event.get("event", "")
+                event_name = event.get("name", "")
+                event_run_id = event.get("run_id", "")
+                event_data = event.get("data", {})
+
+                # Tool execution events
+                if event_type == "on_tool_start":
+                    tool_input = event_data.get("input", {})
+                    yield AgentEvent.tool_start(
+                        name=event_name,
+                        run_id=event_run_id,
+                        input_data=tool_input if isinstance(tool_input, dict) else {"input": str(tool_input)},
+                    )
+
+                elif event_type == "on_tool_end":
+                    tool_output = event_data.get("output", "")
+                    yield AgentEvent.tool_end(
+                        name=event_name,
+                        run_id=event_run_id,
+                        output=str(tool_output)[:2000],  # Truncate long outputs
+                    )
+
+                # LLM streaming events
+                elif event_type == "on_chat_model_stream":
+                    chunk = event_data.get("chunk")
+                    if chunk and hasattr(chunk, "content") and chunk.content:
+                        content = chunk.content
+                        # Handle string content (OpenAI-style)
+                        if isinstance(content, str) and content:
+                            full_response += content
+                            yield AgentEvent.text_delta(content, run_id=event_run_id)
+                        # Handle list of content blocks (Anthropic-style)
+                        # Format: [{'text': 'Hello', 'type': 'text', 'index': 0}]
+                        elif isinstance(content, list):
+                            for block in content:
+                                if isinstance(block, dict):
+                                    # Text content block
+                                    if block.get("type") == "text" and block.get("text"):
+                                        text = block["text"]
+                                        full_response += text
+                                        yield AgentEvent.text_delta(text, run_id=event_run_id)
+                                    # Tool use block (for debugging/logging)
+                                    elif block.get("type") == "tool_use":
+                                        # Tool calls are handled by on_tool_start/end
+                                        pass
+                                    # Input JSON delta (tool input streaming)
+                                    elif block.get("type") == "input_json_delta":
+                                        # Tool input streaming, skip for now
+                                        pass
+
+            # Emit agent end event
+            yield AgentEvent.agent_end(name=self.name, run_id=run_id)
+
+        except Exception as e:
+            logger.exception("Error during astream_events: %s", e)
+            yield AgentEvent.error(str(e), run_id=run_id)
+            raise
+
+        # Update session
+        if session:
+            session.add_message(HumanMessage(content=message))
+            session.add_message(AIMessage(content=full_response))
+            await self._save_session(session)
 
     def _extract_content(self, response: Any) -> str:
         """Extract text content from model response.

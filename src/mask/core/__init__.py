@@ -4,8 +4,13 @@ This module provides the core abstractions for the MASK framework:
 - Skill definitions and metadata
 - State management for Progressive Disclosure
 - Custom exceptions
+- Streaming events for real-time agent output
 """
 
+from mask.core.events import (
+    AgentEvent,
+    EventType,
+)
 from mask.core.exceptions import (
     MaskError,
     SkillError,
@@ -38,6 +43,9 @@ from mask.core.state import (
 from mask.core.registry import SkillRegistry
 
 __all__ = [
+    # Events
+    "AgentEvent",
+    "EventType",
     # Exceptions
     "MaskError",
     "SkillError",
