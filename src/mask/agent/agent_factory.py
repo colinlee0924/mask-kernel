@@ -2,6 +2,12 @@
 
 This module provides factory functions for creating MASK agents with
 common configurations.
+
+Features:
+- Auto-discovery of skills from configured directories
+- Tier-based model selection (FAST, THINKING, PRO)
+- Automatic inclusion of filesystem tools for Level 3 progressive disclosure
+- Session storage integration for stateful agents
 """
 
 import logging
@@ -32,6 +38,8 @@ def create_mask_agent(
     session_store: Optional[SessionStore] = None,
     additional_tools: Optional[List[BaseTool]] = None,
     skills_dir: Optional[str | Path] = None,
+    enable_file_access: bool = True,
+    file_access_paths: Optional[List[Path]] = None,
 ) -> SimpleAgent:
     """Create a MASK agent with common configuration.
 
@@ -40,6 +48,7 @@ def create_mask_agent(
     - Auto-discovering skills from skills directory
     - Creating LLM from tier specification
     - Setting up session storage if needed
+    - Optionally including filesystem tools for Level 3 progressive disclosure
 
     Args:
         model: Optional pre-configured model. If not provided, created from tier.
@@ -52,6 +61,10 @@ def create_mask_agent(
         session_store: Storage backend for stateful operation.
         additional_tools: Non-skill tools to include.
         skills_dir: Skills directory. Defaults to {config_dir}/skills or src/*/skills.
+        enable_file_access: Whether to include read_file tool for Level 3 progressive
+            disclosure. Defaults to True.
+        file_access_paths: Optional list of allowed paths for file access. If not
+            provided, defaults to the skills directory only (for security).
 
     Returns:
         Configured SimpleAgent instance.
@@ -65,6 +78,12 @@ def create_mask_agent(
             tier=ModelTier.PRO,
             stateless=False,
             session_store=RedisSessionStore("redis://localhost:6379"),
+        )
+
+        # With restricted file access
+        agent = create_mask_agent(
+            enable_file_access=True,
+            file_access_paths=[Path("/app/skills"), Path("/app/data")],
         )
     """
     config_path = Path(config_dir)
@@ -83,7 +102,9 @@ def create_mask_agent(
             default="You are a helpful assistant.",
         )
 
-    # Setup skill registry
+    # Setup skill registry and determine skills path
+    skills_path: Optional[Path] = None
+
     if skill_registry is None:
         skill_registry = SkillRegistry()
 
@@ -99,9 +120,31 @@ def create_mask_agent(
                 if src_skills:
                     skills_path = src_skills[0]
 
-        if skills_path.exists():
+        if skills_path and skills_path.exists():
             count = skill_registry.discover_from_directory(skills_path)
             logger.debug("Discovered %d skills from %s", count, skills_path)
+
+    # Prepare additional tools list
+    all_additional_tools = list(additional_tools or [])
+
+    # Add filesystem tools for Level 3 progressive disclosure
+    if enable_file_access:
+        from mask.tools.filesystem import create_read_file_tool
+
+        # Determine allowed paths for security
+        allowed_paths = file_access_paths
+        if allowed_paths is None and skills_path and skills_path.exists():
+            # Default: only allow access to skills directory
+            allowed_paths = [skills_path]
+
+        read_file_tool = create_read_file_tool(
+            allowed_prefixes=allowed_paths,
+        )
+        all_additional_tools.append(read_file_tool)
+        logger.debug(
+            "Added read_file tool with allowed paths: %s",
+            [str(p) for p in (allowed_paths or [])],
+        )
 
     # Create agent
     agent = SimpleAgent(
@@ -110,13 +153,14 @@ def create_mask_agent(
         system_prompt=system_prompt,
         stateless=stateless,
         session_store=session_store,
-        additional_tools=additional_tools,
+        additional_tools=all_additional_tools if all_additional_tools else None,
     )
 
     logger.info(
-        "Created MASK agent: stateless=%s, skills=%d",
+        "Created MASK agent: stateless=%s, skills=%d, file_access=%s",
         stateless,
         len(skill_registry),
+        enable_file_access,
     )
 
     return agent
