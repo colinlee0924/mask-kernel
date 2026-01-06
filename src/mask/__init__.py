@@ -17,10 +17,12 @@ Modules:
     - mask.loader: Skill loaders (SKILL.md, Python)
     - mask.session: Session management
     - mask.storage: Storage backends (Memory, Redis, PostgreSQL)
+    - mask.checkpointer: LangGraph checkpointer integrations
+    - mask.tools: Built-in tools (read_file, list_directory)
     - mask.a2a: A2A Protocol integration
     - mask.mcp: MCP integration
     - mask.observability: OpenInference tracing
-    - mask.cli: CLI commands (mask init, mask run)
+    - mask.cli: CLI commands (mask init, mask run, mask skills)
 """
 
 __version__ = "0.1.0"

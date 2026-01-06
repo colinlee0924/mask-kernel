@@ -31,6 +31,7 @@ dependencies = [
     # CLI
     "typer>=0.12.0",
     "jinja2>=3.1.0",
+    "python-dotenv>=1.0.0",
     # A2A Protocol (with http-server extras for SSE support)
     "a2a-sdk[http-server]>=0.2.0",
     # Server
@@ -45,6 +46,12 @@ dependencies = [
 # Storage backends
 redis = ["redis>=5.0"]
 postgresql = ["asyncpg>=0.29.0", "sqlalchemy>=2.0"]
+
+# LangGraph checkpointer for PostgreSQL (multi-turn conversation persistence)
+checkpointer-postgres = [
+    "langgraph-checkpoint-postgres>=2.0.0",
+    "psycopg[binary,pool]>=3.1.0",
+]
 
 # Observability - Langfuse (recommended for multi-tenant production)
 observability = [
@@ -77,7 +84,7 @@ dev = [
 
 # All optional dependencies
 all = [
-    "mask-kernel[redis,postgresql,observability,anthropic,openai,mcp,dev]",
+    "mask-kernel[redis,postgresql,checkpointer-postgres,observability,anthropic,openai,mcp,dev]",
 ]
 
 [project.scripts]
