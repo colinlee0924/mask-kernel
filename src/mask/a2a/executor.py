@@ -362,9 +362,9 @@ class MaskAgentExecutor(AgentExecutor):
                         content = msg.content
                         # Handle both str and list content types
                         if isinstance(content, list):
-                            # Join list content (e.g., from tool calls)
+                            # Content blocks format: [{'text': '...', 'type': 'text', 'index': 0}]
                             chunk = "".join(
-                                str(item) if not isinstance(item, dict) else ""
+                                item.get("text", "") if isinstance(item, dict) else str(item)
                                 for item in content
                             )
                         else:
