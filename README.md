@@ -17,6 +17,7 @@ MASK Kernel is designed to **enhance, not replace** native SDKs. Developers use:
 - **A2A Protocol**: Native A2A SDK integration with `create_a2a_executor()` helper
 - **MCP Integration**: Load MCP tools with `load_mcp_tools_from_config()`
 - **Real-time Streaming**: Default `stream=True` for Open WebUI integration
+- **OpenAI-Compatible API**: Wrapper for A2A agents to work with Open WebUI
 - **CLI Scaffold**: Generate new agent projects with `mask init`
 - **Built-in Observability**: Phoenix/Langfuse tracing with A2A noise filtering
 
@@ -93,7 +94,9 @@ curl -X POST http://localhost:10001/ \
 
 ## Architecture
 
-### Agent Creation (using native LangChain)
+### Agent Creation (using LangChain 1.x `create_agent`)
+
+MASK uses [LangChain's `create_agent` API](https://docs.langchain.com/oss/python/langchain/overview) (not LangGraph's `create_react_agent`). This provides a simpler, more intuitive interface built on top of LangGraph:
 
 ```python
 # src/my_agent/agent.py
@@ -180,6 +183,7 @@ my-agent/
 │   ├── __init__.py
 │   ├── agent.py              # Agent creation (LangChain + SkillMiddleware)
 │   ├── main.py               # A2A server entry point
+│   ├── main_openai.py        # OpenAI-compatible wrapper for Open WebUI
 │   ├── prompts/
 │   │   └── system.md         # System prompt
 │   ├── skills/               # Progressive Disclosure skills
@@ -191,6 +195,53 @@ my-agent/
 └── tests/
     ├── __init__.py
     └── test_agent.py
+```
+
+## Open WebUI Integration
+
+MASK provides an OpenAI-compatible wrapper to test your A2A agent with Open WebUI:
+
+### Architecture
+
+```
+Open WebUI → OpenAI Wrapper (:11434) → A2A Agent (:10001)
+```
+
+### Usage
+
+```bash
+# Terminal 1: Start A2A agent
+python -m my_agent.main
+
+# Terminal 2: Start OpenAI wrapper
+python -m my_agent.main_openai
+```
+
+### Open WebUI Configuration
+
+1. Settings → Connections → OpenAI API
+2. Click "+" to add connection:
+   - URL: `http://localhost:11434/v1` (or `http://host.docker.internal:11434/v1` if Open WebUI runs in Docker)
+   - API Key: `sk-dummy` (any value)
+3. Select your agent model in the chat
+
+### Programmatic Usage
+
+```python
+from mask.a2a import create_openai_compat_app, run_openai_compat_server
+
+# Option 1: Get FastAPI app for custom setup
+app = create_openai_compat_app(
+    a2a_base_url="http://localhost:10001",
+    model_name="my-agent",
+)
+
+# Option 2: Run server directly
+run_openai_compat_server(
+    a2a_base_url="http://localhost:10001",
+    model_name="my-agent",
+    port=11434,
+)
 ```
 
 ## Key Concepts
