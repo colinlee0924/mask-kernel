@@ -23,8 +23,8 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
-from a2a.types import TaskArtifactUpdateEvent
-from a2a.utils import new_agent_text_message, new_text_artifact
+from a2a.types import Artifact, Part, TaskArtifactUpdateEvent, TextPart
+from a2a.utils import new_agent_text_message
 
 from mask.core.state import HandoffContext
 from mask.observability.attributes import (
@@ -39,6 +39,31 @@ if TYPE_CHECKING:
     from mask.agent.base_agent import BaseAgent
 
 logger = logging.getLogger(__name__)
+
+
+def _create_text_artifact(
+    artifact_id: str,
+    name: str,
+    text: str,
+) -> Artifact:
+    """Create a text artifact with a specific artifact_id.
+
+    Unlike new_text_artifact() which generates a new ID each time,
+    this function allows reusing the same ID for streaming append operations.
+
+    Args:
+        artifact_id: The artifact ID to use.
+        name: Human-readable name for the artifact.
+        text: The text content.
+
+    Returns:
+        Artifact with the specified ID.
+    """
+    return Artifact(
+        artifact_id=artifact_id,
+        name=name,
+        parts=[Part(root=TextPart(text=text))],
+    )
 
 
 class MaskAgentExecutor(AgentExecutor):
@@ -388,9 +413,9 @@ class MaskAgentExecutor(AgentExecutor):
 
                         # Send chunk immediately via TaskArtifactUpdateEvent
                         if artifact_id is None:
-                            # First chunk - create new artifact
-                            artifact = new_text_artifact("response", chunk)
-                            artifact_id = artifact.artifact_id
+                            # First chunk - generate artifact ID and create artifact
+                            artifact_id = str(uuid.uuid4())
+                            artifact = _create_text_artifact(artifact_id, "response", chunk)
                             await event_queue.enqueue_event(
                                 TaskArtifactUpdateEvent(
                                     artifact=artifact,
@@ -400,21 +425,22 @@ class MaskAgentExecutor(AgentExecutor):
                                 )
                             )
                         else:
-                            # Subsequent chunks - append
+                            # Subsequent chunks - append using SAME artifact_id
+                            artifact = _create_text_artifact(artifact_id, "response", chunk)
                             await event_queue.enqueue_event(
                                 TaskArtifactUpdateEvent(
-                                    artifact=new_text_artifact("response", chunk),
+                                    artifact=artifact,
                                     contextId=context_id,
                                     taskId=task_id,
                                     append=True,
                                 )
                             )
 
-            # Send final chunk marker
+            # Send final chunk marker with same artifact_id
             if artifact_id:
                 await event_queue.enqueue_event(
                     TaskArtifactUpdateEvent(
-                        artifact=new_text_artifact("response", ""),
+                        artifact=_create_text_artifact(artifact_id, "response", ""),
                         contextId=context_id,
                         taskId=task_id,
                         append=True,
@@ -430,8 +456,9 @@ class MaskAgentExecutor(AgentExecutor):
 
                 # Send chunk immediately via TaskArtifactUpdateEvent
                 if artifact_id is None:
-                    artifact = new_text_artifact("response", chunk)
-                    artifact_id = artifact.artifact_id
+                    # First chunk - generate artifact ID and create artifact
+                    artifact_id = str(uuid.uuid4())
+                    artifact = _create_text_artifact(artifact_id, "response", chunk)
                     await event_queue.enqueue_event(
                         TaskArtifactUpdateEvent(
                             artifact=artifact,
@@ -441,20 +468,22 @@ class MaskAgentExecutor(AgentExecutor):
                         )
                     )
                 else:
+                    # Subsequent chunks - append using SAME artifact_id
+                    artifact = _create_text_artifact(artifact_id, "response", chunk)
                     await event_queue.enqueue_event(
                         TaskArtifactUpdateEvent(
-                            artifact=new_text_artifact("response", chunk),
+                            artifact=artifact,
                             contextId=context_id,
                             taskId=task_id,
                             append=True,
                         )
                     )
 
-            # Send final chunk marker
+            # Send final chunk marker with same artifact_id
             if artifact_id:
                 await event_queue.enqueue_event(
                     TaskArtifactUpdateEvent(
-                        artifact=new_text_artifact("response", ""),
+                        artifact=_create_text_artifact(artifact_id, "response", ""),
                         contextId=context_id,
                         taskId=task_id,
                         append=True,

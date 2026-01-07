@@ -44,6 +44,13 @@ class SkillMetadata:
         allowed_tools: Optional space-delimited list of pre-approved tools.
         license: Optional license name or reference.
         compatibility: Optional environment requirements.
+
+    TODO: Add support for additional fields from external skill systems:
+        - visibility: Skill visibility level ('public', 'private', etc.)
+        - dependencies: List of required packages (e.g., ["pandas", "numpy"])
+        - author: Skill author name/identifier
+    These fields are commonly used in other skill frameworks but not yet
+    implemented in MASK. See: https://github.com/anthropics/anthropic-cookbook
     """
 
     name: str
