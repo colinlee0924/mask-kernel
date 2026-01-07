@@ -25,7 +25,7 @@ services:
       - A2A_HOST=0.0.0.0
       - A2A_PORT=10001
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:10001/"]
+      test: ["CMD", "curl", "-f", "http://localhost:10001/.well-known/agent.json"]
       interval: 30s
       timeout: 10s
       retries: 3
