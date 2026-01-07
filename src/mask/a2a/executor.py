@@ -287,7 +287,7 @@ class MaskAgentExecutor(AgentExecutor):
             )
         else:
             return await self._execute_non_streaming_capture(
-                message, event_queue, session_id, handoff_context
+                message, event_queue, session_id, handoff_context, context_id
             )
 
     async def _execute_non_streaming_capture(
@@ -296,6 +296,7 @@ class MaskAgentExecutor(AgentExecutor):
         event_queue: EventQueue,
         session_id: Optional[str] = None,
         handoff_context: Optional[HandoffContext] = None,
+        context_id: Optional[str] = None,
     ) -> str:
         """Execute agent without streaming and capture response.
 
@@ -305,8 +306,13 @@ class MaskAgentExecutor(AgentExecutor):
             # CompiledStateGraph: invoke({"messages": [HumanMessage(...)]})
             from langchain_core.messages import HumanMessage
 
+            # Use context_id as thread_id for multi-turn conversation memory
+            thread_id = context_id or str(uuid.uuid4())
+            config = {"configurable": {"thread_id": thread_id}}
+
             result = await self.agent.ainvoke(
-                {"messages": [HumanMessage(content=message)]}
+                {"messages": [HumanMessage(content=message)]},
+                config=config,
             )
             # Extract last AI message content
             messages = result.get("messages", [])
@@ -351,8 +357,13 @@ class MaskAgentExecutor(AgentExecutor):
             # CompiledStateGraph: use astream with stream_mode="messages"
             from langchain_core.messages import HumanMessage
 
+            # Use context_id as thread_id for multi-turn conversation memory
+            thread_id = context_id or str(uuid.uuid4())
+            config = {"configurable": {"thread_id": thread_id}}
+
             async for event in self.agent.astream(
                 {"messages": [HumanMessage(content=message)]},
+                config=config,
                 stream_mode="messages",
             ):
                 # Extract content from streaming events
