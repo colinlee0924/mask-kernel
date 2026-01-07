@@ -3,6 +3,7 @@
 from pathlib import Path
 
 from langchain.agents import create_agent as langchain_create_agent
+from langgraph.checkpoint.memory import MemorySaver
 
 from mask.core import SkillRegistry
 from mask.middleware import SkillMiddleware
@@ -59,6 +60,10 @@ async def create_agent(tier: ModelTier = ModelTier.THINKING):
     # (not filtered by skill state)
     middleware = SkillMiddleware(registry, additional_tools=tools)
 
+    # Create checkpointer for multi-turn conversation memory
+    # Uses in-memory storage; for production, consider PostgresSaver or RedisSaver
+    checkpointer = MemorySaver()
+
     # Create agent using native LangChain API
     # Returns CompiledStateGraph - pass directly to create_a2a_executor()
     return langchain_create_agent(
@@ -66,4 +71,5 @@ async def create_agent(tier: ModelTier = ModelTier.THINKING):
         tools=tools,
         system_prompt=load_system_prompt(),
         middleware=[middleware],
+        checkpointer=checkpointer,
     )
