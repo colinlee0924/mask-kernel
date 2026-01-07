@@ -10,7 +10,7 @@ from a2a import A2AServer
 from mask.a2a.helpers import create_a2a_executor
 from mask.observability import setup_openinference_tracing
 
-from {{ module_name }}.agent import create_{{ module_name }}_agent
+from {{ module_name }}.agent import create_agent
 
 # Load .env file from project root
 env_path = Path(__file__).parent.parent.parent / ".env"
@@ -27,7 +27,7 @@ async def main():
     )
 
     # Create agent
-    agent = await create_{{ module_name }}_agent()
+    agent = await create_agent()
 
     # Create executor using MASK helper
     executor = create_a2a_executor(agent, server_name="{{ project_name }}")

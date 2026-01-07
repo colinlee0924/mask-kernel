@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from langchain.agents import create_agent
+from langchain.agents import create_agent as langchain_create_agent
 
 from mask.core import SkillRegistry
 from mask.middleware import SkillMiddleware
@@ -20,7 +20,7 @@ def load_system_prompt() -> str:
     return "You are a helpful assistant."
 
 
-async def create_{{ module_name }}_agent(tier: ModelTier = ModelTier.THINKING):
+async def create_agent(tier: ModelTier = ModelTier.THINKING):
     """Create agent using LangChain + MASK SkillMiddleware.
 
     This uses the native LangChain create_agent API with MASK's
@@ -58,7 +58,7 @@ async def create_{{ module_name }}_agent(tier: ModelTier = ModelTier.THINKING):
     middleware = SkillMiddleware(registry)
 
     # Create agent using native LangChain API
-    return create_agent(
+    return langchain_create_agent(
         model=model,
         tools=tools,
         system_prompt=load_system_prompt(),
