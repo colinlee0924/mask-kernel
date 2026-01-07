@@ -2,9 +2,14 @@
 
 This module provides MaskA2AServer for exposing MASK agents as
 A2A remote services, following patterns from a2a-python-samples.
+
+.. deprecated::
+    MaskA2AServer is deprecated. Use the native A2A SDK with
+    :func:`mask.a2a.helpers.create_a2a_executor` instead.
 """
 
 import logging
+import warnings
 from typing import TYPE_CHECKING, List, Optional
 
 from a2a.server.apps import A2AStarletteApplication
@@ -71,7 +76,17 @@ class MaskA2AServer:
             stream: Whether to enable streaming responses.
             default_input_modes: Supported input modes (default: ["text"]).
             default_output_modes: Supported output modes (default: ["text"]).
+
+        .. deprecated::
+            Use native A2A SDK with mask.a2a.helpers.create_a2a_executor instead.
         """
+        warnings.warn(
+            "MaskA2AServer is deprecated. Use native A2A SDK with "
+            "mask.a2a.helpers.create_a2a_executor instead. "
+            "See https://github.com/colinlee0924/mask-kernel for migration guide.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.agent = agent
         self.name = name
         self.description = description

@@ -1,0 +1,52 @@
+"""Tests for {{ project_name }} agent."""
+
+import pytest
+import httpx
+
+
+@pytest.fixture
+def base_url():
+    """Base URL for the A2A server."""
+    return "http://localhost:10001"
+
+
+@pytest.mark.asyncio
+async def test_health_endpoint(base_url):
+    """Test that health endpoint is accessible."""
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{base_url}/health")
+        assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_agent_card_endpoint(base_url):
+    """Test that agent card endpoint returns valid data."""
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{base_url}/.well-known/agent.json")
+        assert response.status_code == 200
+        data = response.json()
+        assert "name" in data
+
+
+@pytest.mark.asyncio
+async def test_agent_can_respond(base_url):
+    """Test that agent can respond to messages."""
+    from uuid import uuid4
+
+    async with httpx.AsyncClient() as client:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": str(uuid4()),
+            "method": "message/send",
+            "params": {
+                "message": {
+                    "role": "user",
+                    "parts": [{"kind": "text", "text": "Hello, are you there?"}],
+                    "messageId": uuid4().hex,
+                    "contextId": uuid4().hex,
+                }
+            }
+        }
+
+        response = await client.post(f"{base_url}/", json=payload)
+        assert response.status_code == 200

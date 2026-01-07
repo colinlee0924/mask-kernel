@@ -1,0 +1,14 @@
+"""Custom Tools for the agent."""
+
+from {{ module_name }}.tools.example import hello_world
+
+
+def get_custom_tools() -> list:
+    """Get all custom tools.
+
+    Returns:
+        List of LangChain tool instances.
+    """
+    return [
+        hello_world,
+    ]

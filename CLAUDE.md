@@ -48,10 +48,14 @@ mask-kernel/
 │   │   ├── agent_factory.py  # create_mask_agent() factory
 │   │   └── prompt_loader.py  # Load prompts from config/
 │   ├── a2a/                  # A2A Protocol integration
+│   │   ├── helpers.py        # create_a2a_executor() helper (recommended)
 │   │   ├── executor.py       # MaskAgentExecutor bridges MASK to A2A
-│   │   └── server.py         # MaskA2AServer for exposing agents
+│   │   └── server.py         # MaskA2AServer for exposing agents (deprecated)
 │   ├── cli/                  # CLI commands
 │   │   ├── main.py           # Typer app entry point
+│   │   ├── template_engine.py # Jinja2-based project scaffolding
+│   │   ├── templates/        # Project templates
+│   │   │   └── default/      # Default template for mask init
 │   │   └── commands/
 │   │       └── init.py       # `mask init` project scaffolding
 │   ├── core/                 # Core abstractions
@@ -303,10 +307,14 @@ openai_model = factory.get_model(tier=ModelTier.THINKING, provider="openai")
 ```python
 from mask.observability import setup_openinference_tracing
 
-# Phoenix (recommended for development)
+# Phoenix (recommended for development) - reads from environment variables
+setup_openinference_tracing()
+
+# Or with explicit configuration
 setup_openinference_tracing(
     project_name="my-agent",
     endpoint="http://localhost:6006",
+    api_key="your-phoenix-api-key",  # Optional for cloud Phoenix
     filter_a2a_noise=True,  # Filters out A2A SDK traces
 )
 
@@ -318,7 +326,28 @@ setup_dual_tracing(
 )
 ```
 
-### Creating an A2A Server
+### Creating an A2A Server (Recommended)
+
+Use the native A2A SDK with MASK helpers:
+
+```python
+from a2a import A2AServer
+from mask.a2a.helpers import create_a2a_executor
+
+# Create your agent (using native LangChain or MASK agent)
+agent = create_my_agent()
+
+# Create executor using MASK helper
+executor = create_a2a_executor(agent, server_name="my-agent")
+
+# Use native A2A SDK
+server = A2AServer(executor)
+server.run(port=10001)
+```
+
+### Creating an A2A Server (Legacy - Deprecated)
+
+> **Note**: `MaskA2AServer` is deprecated. Use the native A2A SDK pattern above.
 
 ```python
 from mask.a2a import MaskA2AServer
@@ -364,6 +393,8 @@ response = await child_agent.invoke(
 | `GOOGLE_API_KEY` | Google API key | - |
 | `MASK_LLM_PROVIDER` | Default LLM provider | `anthropic` |
 | `PHOENIX_COLLECTOR_ENDPOINT` | Phoenix endpoint | `http://localhost:6006` |
+| `PHOENIX_PROJECT_NAME` | Phoenix project name | `mask-agent` |
+| `PHOENIX_API_KEY` | Phoenix API key (for cloud) | - |
 | `LANGFUSE_PUBLIC_KEY` | Langfuse public key | - |
 | `LANGFUSE_SECRET_KEY` | Langfuse secret key | - |
 | `LANGFUSE_BASE_URL` | Langfuse URL | `https://cloud.langfuse.com` |

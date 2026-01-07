@@ -1,0 +1,43 @@
+"""A2A Server using native a2a-sdk + MASK helpers."""
+
+import asyncio
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+from a2a import A2AServer
+
+from mask.a2a.helpers import create_a2a_executor
+from mask.observability import setup_openinference_tracing
+
+from {{ module_name }}.agent import create_{{ module_name }}_agent
+
+# Load .env file from project root
+env_path = Path(__file__).parent.parent.parent / ".env"
+load_dotenv(env_path)
+
+
+async def main():
+    """Start the A2A server."""
+    # Setup Phoenix tracing
+    setup_openinference_tracing(
+        project_name=os.environ.get("PHOENIX_PROJECT_NAME", "{{ project_name }}"),
+        endpoint=os.environ.get("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006"),
+        api_key=os.environ.get("PHOENIX_API_KEY"),
+    )
+
+    # Create agent
+    agent = await create_{{ module_name }}_agent()
+
+    # Create executor using MASK helper
+    executor = create_a2a_executor(agent, server_name="{{ project_name }}")
+
+    # Create and run native A2A server
+    server = A2AServer(executor)
+
+    print(f"Starting {{ project_name }} on port 10001...")
+    server.run(port=10001)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

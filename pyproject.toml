@@ -91,6 +91,9 @@ Repository = "https://github.com/colinlee0924/mask-kernel"
 [tool.hatch.build.targets.wheel]
 packages = ["src/mask"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"src/mask/cli/templates" = "mask/cli/templates"
+
 [tool.ruff]
 target-version = "py310"
 line-length = 100

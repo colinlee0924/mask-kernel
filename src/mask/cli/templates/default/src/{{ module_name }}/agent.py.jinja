@@ -1,0 +1,66 @@
+"""Agent configuration using LangChain create_agent + MASK SkillMiddleware."""
+
+from pathlib import Path
+
+from langchain.agents import create_agent
+
+from mask.core import SkillRegistry
+from mask.middleware import SkillMiddleware
+from mask.models import LLMFactory, ModelTier
+from mask.mcp import load_mcp_tools_from_config
+
+from {{ module_name }}.tools import get_custom_tools
+
+
+def load_system_prompt() -> str:
+    """Load system prompt from prompts directory."""
+    prompt_file = Path(__file__).parent / "prompts" / "system.md"
+    if prompt_file.exists():
+        return prompt_file.read_text(encoding="utf-8")
+    return "You are a helpful assistant."
+
+
+async def create_{{ module_name }}_agent(tier: ModelTier = ModelTier.THINKING):
+    """Create agent using LangChain + MASK SkillMiddleware.
+
+    This uses the native LangChain create_agent API with MASK's
+    SkillMiddleware for Progressive Disclosure of skills.
+
+    Args:
+        tier: Model capability tier to use.
+
+    Returns:
+        LangChain agent with Progressive Disclosure support.
+    """
+    # Initialize LLM from tier
+    model = LLMFactory().get_model(tier=tier)
+
+    # Initialize skill registry and discover skills
+    registry = SkillRegistry()
+    skills_dir = Path(__file__).parent / "skills"
+    if skills_dir.exists():
+        registry.discover_from_directory(skills_dir)
+
+    # Load MCP tools if config exists
+    mcp_config = Path(__file__).parent / "config" / "mcp_servers.json"
+    mcp_tools = []
+    if mcp_config.exists():
+        mcp_tools = await load_mcp_tools_from_config(mcp_config)
+
+    # Combine all tools
+    tools = [
+        *registry.get_all_tools(),
+        *get_custom_tools(),
+        *mcp_tools,
+    ]
+
+    # Create SkillMiddleware for Progressive Disclosure
+    middleware = SkillMiddleware(registry)
+
+    # Create agent using native LangChain API
+    return create_agent(
+        model=model,
+        tools=tools,
+        system_prompt=load_system_prompt(),
+        middleware=[middleware],
+    )

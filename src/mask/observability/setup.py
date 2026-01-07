@@ -640,8 +640,9 @@ class FilteringSpanProcessor:
 
 
 def setup_openinference_tracing(
-    project_name: str = "mask-agent",
+    project_name: Optional[str] = None,
     endpoint: Optional[str] = None,
+    api_key: Optional[str] = None,
     batch: bool = True,
     filter_a2a_noise: bool = True,
 ) -> bool:
@@ -651,8 +652,12 @@ def setup_openinference_tracing(
 
     Args:
         project_name: Name of the project for trace grouping in Phoenix UI.
+            If not provided, uses PHOENIX_PROJECT_NAME env var or defaults
+            to "mask-agent".
         endpoint: Phoenix endpoint URL. If not provided, uses
             PHOENIX_COLLECTOR_ENDPOINT env var or defaults to local.
+        api_key: Phoenix API key for authentication. If not provided, uses
+            PHOENIX_API_KEY env var. Optional for local Phoenix instances.
         batch: Whether to batch trace exports (recommended for production).
         filter_a2a_noise: If True (default), filter out A2A SDK infrastructure
             spans to reduce noise and focus on agent execution.
@@ -663,8 +668,14 @@ def setup_openinference_tracing(
     Example:
         from mask.observability import setup_openinference_tracing
 
-        # Setup tracing before creating agents
-        setup_openinference_tracing("my-jira-agent")
+        # Setup tracing before creating agents (reads from env vars)
+        setup_openinference_tracing()
+
+        # Or with explicit configuration
+        setup_openinference_tracing(
+            project_name="my-jira-agent",
+            api_key="your-phoenix-api-key",
+        )
 
         # Now all LangChain operations will be traced
         agent = create_mask_agent()
@@ -685,9 +696,10 @@ def setup_openinference_tracing(
         )
         return False
 
-    # Determine endpoint
-    if endpoint is None:
-        endpoint = os.environ.get("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006")
+    # Determine configuration from args or environment variables
+    project_name = project_name or os.environ.get("PHOENIX_PROJECT_NAME", "mask-agent")
+    endpoint = endpoint or os.environ.get("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006")
+    api_key = api_key or os.environ.get("PHOENIX_API_KEY")
 
     try:
         # Try to use Phoenix PROJECT_NAME constant for proper project name
@@ -703,10 +715,16 @@ def setup_openinference_tracing(
         # Create tracer provider
         tracer_provider = TracerProvider(resource=resource)
 
+        # Build headers with optional API key authentication
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+            logger.debug("Phoenix API key configured")
+
         # Create exporter
         exporter = OTLPSpanExporter(
             endpoint=f"{endpoint}/v1/traces",
-            headers={},
+            headers=headers,
         )
 
         # Create span processor with optional filtering
