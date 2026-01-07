@@ -55,9 +55,12 @@ async def create_agent(tier: ModelTier = ModelTier.THINKING):
     ]
 
     # Create SkillMiddleware for Progressive Disclosure
-    middleware = SkillMiddleware(registry)
+    # CRITICAL: Pass tools as additional_tools so they're always visible
+    # (not filtered by skill state)
+    middleware = SkillMiddleware(registry, additional_tools=tools)
 
     # Create agent using native LangChain API
+    # Returns CompiledStateGraph - pass directly to create_a2a_executor()
     return langchain_create_agent(
         model=model,
         tools=tools,

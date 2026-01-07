@@ -39,7 +39,8 @@ def main():
     agent = asyncio.run(setup_agent())
 
     # Create executor using MASK helper
-    executor = create_a2a_executor(agent, server_name="{{ project_name }}")
+    # stream=True enables real-time streaming for Open WebUI integration
+    executor = create_a2a_executor(agent, server_name="{{ project_name }}", stream=True)
 
     # Configure server
     host = os.environ.get("A2A_HOST", "0.0.0.0")
@@ -59,7 +60,7 @@ def main():
                 tags=["general"],
             ),
         ],
-        capabilities=AgentCapabilities(streaming=False),
+        capabilities=AgentCapabilities(streaming=True),
         defaultInputModes=["text"],
         defaultOutputModes=["text"],
     )
