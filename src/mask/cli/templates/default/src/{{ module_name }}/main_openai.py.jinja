@@ -1,0 +1,54 @@
+"""OpenAI-Compatible Wrapper for A2A Agent.
+
+This server provides OpenAI-compatible API endpoints that wrap the A2A agent,
+enabling integration with Open WebUI or any OpenAI-compatible client.
+
+Architecture:
+    Open WebUI → OpenAI Wrapper (:11434) → A2A Agent (:10001)
+
+Prerequisites:
+    1. Start A2A agent first: python -m {{ module_name }}.main
+    2. Then start this wrapper: python -m {{ module_name }}.main_openai
+
+Open WebUI Configuration:
+    1. Settings → Connections → OpenAI API
+    2. Click "+" to add connection:
+       - URL: http://localhost:11434/v1
+       - API Key: sk-dummy (any value)
+    3. Select "{{ project_name }}" in Models
+"""
+
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+from mask.a2a import run_openai_compat_server
+
+# Load .env file from project root
+env_path = Path(__file__).parent.parent.parent / ".env"
+load_dotenv(env_path)
+
+
+def main():
+    """Start the OpenAI-compatible wrapper server."""
+    # A2A agent URL
+    a2a_host = os.environ.get("A2A_HOST", "localhost")
+    a2a_port = int(os.environ.get("A2A_PORT", "10001"))
+    a2a_base_url = f"http://{a2a_host}:{a2a_port}"
+
+    # OpenAI wrapper server config
+    host = os.environ.get("OPENAI_COMPAT_HOST", "0.0.0.0")
+    port = int(os.environ.get("OPENAI_COMPAT_PORT", "11434"))
+
+    # Run OpenAI-compatible server
+    run_openai_compat_server(
+        a2a_base_url=a2a_base_url,
+        model_name="{{ project_name }}",
+        host=host,
+        port=port,
+    )
+
+
+if __name__ == "__main__":
+    main()

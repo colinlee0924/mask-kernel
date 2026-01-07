@@ -144,6 +144,13 @@ def parse_skill_md(
         instructions = content[match.end() :].strip()
 
         # Parse YAML
+        # TODO: Handle descriptions containing colons (:) which YAML interprets as mappings.
+        # The Anthropic Agent Skills spec allows unquoted descriptions with colons,
+        # but yaml.safe_load fails on these. Consider:
+        # 1. Pre-processing to quote the description field
+        # 2. Using ruamel.yaml which handles this better
+        # 3. Custom regex-based frontmatter parsing for simple cases
+        # See: https://github.com/anthropics/anthropic-cookbook/tree/main/misc/agent_skills
         try:
             frontmatter_data = yaml.safe_load(frontmatter_str)
         except yaml.YAMLError as e:

@@ -19,9 +19,15 @@ Progressive Disclosure Flow:
 4. LangGraph updates state
 5. Next model call -> SkillMiddleware filters tools based on new state
 6. Now skill's capability tools are visible
+
+.. deprecated::
+    For new projects, consider using native LangChain ``create_agent`` with
+    ``mask.middleware.SkillMiddleware`` directly. See the migration guide at
+    https://github.com/colinlee0924/mask-kernel for details.
 """
 
 import logging
+import warnings
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, Optional, Sequence
 
@@ -427,7 +433,18 @@ class SimpleAgent(BaseAgent):
             agent_factory: Custom agent factory function. Signature:
                 (model, tools, system_prompt, middleware, state_schema) -> Agent
                 Defaults to LangChain v1.x create_agent.
+
+        .. deprecated::
+            For new projects, use ``langchain.agents.create_agent`` with
+            ``mask.middleware.SkillMiddleware`` directly.
         """
+        warnings.warn(
+            "SimpleAgent is deprecated. For new projects, use "
+            "langchain.agents.create_agent with mask.middleware.SkillMiddleware "
+            "directly. See https://github.com/colinlee0924/mask-kernel for migration guide.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         super().__init__(*args, **kwargs)
         self._graph = None  # Lazy-initialized agent
         self.agent_factory = agent_factory or _default_agent_factory

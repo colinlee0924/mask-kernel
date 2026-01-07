@@ -1,0 +1,85 @@
+"""A2A Server using native a2a-sdk + MASK helpers."""
+
+import asyncio
+import os
+from pathlib import Path
+
+import uvicorn
+from dotenv import load_dotenv
+from a2a.server.apps import A2AStarletteApplication
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.tasks import InMemoryTaskStore
+from a2a.types import AgentCapabilities, AgentCard, AgentSkill
+
+from mask.a2a.helpers import create_a2a_executor
+from mask.observability import setup_openinference_tracing
+
+from {{ module_name }}.agent import create_agent
+
+# Load .env file from project root
+env_path = Path(__file__).parent.parent.parent / ".env"
+load_dotenv(env_path)
+
+
+async def setup_agent():
+    """Async setup for the agent."""
+    return await create_agent()
+
+
+def main():
+    """Start the A2A server."""
+    # Setup Phoenix tracing
+    setup_openinference_tracing(
+        project_name=os.environ.get("PHOENIX_PROJECT_NAME", "{{ project_name }}"),
+        endpoint=os.environ.get("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006"),
+        api_key=os.environ.get("PHOENIX_API_KEY"),
+    )
+
+    # Create agent (async)
+    agent = asyncio.run(setup_agent())
+
+    # Create executor using MASK helper
+    # stream=True enables real-time streaming for Open WebUI integration
+    executor = create_a2a_executor(agent, server_name="{{ project_name }}", stream=True)
+
+    # Configure server
+    host = os.environ.get("A2A_HOST", "0.0.0.0")
+    port = int(os.environ.get("A2A_PORT", "10001"))
+
+    # Create agent card for service discovery
+    agent_card = AgentCard(
+        name="{{ project_name }}",
+        description="A MASK-powered agent",
+        url=f"http://{host}:{port}/",
+        version="1.0.0",
+        skills=[
+            AgentSkill(
+                id="general",
+                name="General Assistant",
+                description="General purpose assistance",
+                tags=["general"],
+            ),
+        ],
+        capabilities=AgentCapabilities(streaming=True),
+        defaultInputModes=["text"],
+        defaultOutputModes=["text"],
+    )
+
+    # Create request handler
+    handler = DefaultRequestHandler(
+        agent_executor=executor,
+        task_store=InMemoryTaskStore(),
+    )
+
+    # Create A2A application
+    app = A2AStarletteApplication(
+        agent_card=agent_card,
+        http_handler=handler,
+    )
+
+    print(f"Starting {{ project_name }} on {host}:{port}...")
+    uvicorn.run(app.build(), host=host, port=port, log_level="info")
+
+
+if __name__ == "__main__":
+    main()

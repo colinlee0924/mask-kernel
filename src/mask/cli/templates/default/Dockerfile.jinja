@@ -1,0 +1,82 @@
+# syntax=docker/dockerfile:1
+# {{ project_name }} - MASK Agent Docker Image
+#
+# Build: docker build -t {{ project_name }} .
+# Run:   docker run -p 10001:10001 --env-file .env {{ project_name }}
+
+# ============================================
+# Base stage - common setup
+# ============================================
+FROM python:3.11-slim AS base
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# ============================================
+# Builder stage - install dependencies
+# ============================================
+FROM base AS builder
+
+# Install git (required for installing packages from GitHub)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv for faster dependency resolution
+RUN pip install uv
+
+# Copy dependency files first (better layer caching)
+COPY pyproject.toml README.md ./
+
+# Create virtual environment
+RUN uv venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Copy source and install
+COPY src/ ./src/
+RUN uv pip install .
+
+# ============================================
+# Production stage - minimal runtime image
+# ============================================
+FROM base AS production
+
+# Copy virtual environment from builder
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Copy application code
+COPY src/ ./src/
+
+# Create non-root user for security
+RUN useradd --create-home --shell /bin/bash appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
+# Default environment variables
+ENV A2A_HOST=0.0.0.0 \
+    A2A_PORT=10001 \
+    OPENAI_COMPAT_HOST=0.0.0.0 \
+    OPENAI_COMPAT_PORT=11434
+
+# Expose ports
+# 10001 - A2A Protocol server
+# 11434 - OpenAI-compatible API (for Open WebUI)
+EXPOSE 10001 11434
+
+# Health check for A2A server
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:${A2A_PORT}/.well-known/agent.json || exit 1
+
+# Default command - run A2A agent
+# Override with: docker run ... python -m {{ module_name }}.main_openai
+CMD ["python", "-m", "{{ module_name }}.main"]

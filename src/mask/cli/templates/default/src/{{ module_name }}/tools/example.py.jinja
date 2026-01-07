@@ -1,0 +1,16 @@
+"""Example tool using LangChain @tool decorator."""
+
+from langchain_core.tools import tool
+
+
+@tool
+def hello_world(name: str) -> str:
+    """Say hello to someone.
+
+    Args:
+        name: The name to greet.
+
+    Returns:
+        A greeting message.
+    """
+    return f"Hello, {name}!"

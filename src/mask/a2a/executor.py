@@ -1,20 +1,29 @@
 """A2A Agent Executor.
 
-This module bridges MASK BaseAgent to A2A AgentExecutor interface,
-following patterns from a2a-python-samples.
+This module bridges MASK agents and LangChain CompiledStateGraph to A2A
+AgentExecutor interface, following patterns from a2a-python-samples.
 
-Supports multi-agent handoffs with context isolation:
-- HandoffContext for passing initial_skills and context_data
-- Task-scoped sessions for agent coordination
-- Parent-child relationship tracking for observability
+Supports:
+- LangChain CompiledStateGraph from create_agent() (recommended)
+- MASK BaseAgent (legacy)
+- Real-time streaming via TaskArtifactUpdateEvent
+- Multi-agent handoffs with context isolation
+
+Usage:
+    from langchain.agents import create_agent
+    from mask.a2a import create_a2a_executor
+
+    graph = create_agent(model, tools, system_prompt)
+    executor = create_a2a_executor(graph, server_name="my-agent")
 """
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, Optional
+import uuid
+from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
-from a2a.types import TaskState, TaskStatus
+from a2a.types import Artifact, Part, TaskArtifactUpdateEvent, TextPart
 from a2a.utils import new_agent_text_message
 
 from mask.core.state import HandoffContext
@@ -25,46 +34,79 @@ from mask.observability.attributes import (
 )
 
 if TYPE_CHECKING:
+    from langgraph.graph.state import CompiledStateGraph
+
     from mask.agent.base_agent import BaseAgent
 
 logger = logging.getLogger(__name__)
 
 
+def _create_text_artifact(
+    artifact_id: str,
+    name: str,
+    text: str,
+) -> Artifact:
+    """Create a text artifact with a specific artifact_id.
+
+    Unlike new_text_artifact() which generates a new ID each time,
+    this function allows reusing the same ID for streaming append operations.
+
+    Args:
+        artifact_id: The artifact ID to use.
+        name: Human-readable name for the artifact.
+        text: The text content.
+
+    Returns:
+        Artifact with the specified ID.
+    """
+    return Artifact(
+        artifact_id=artifact_id,
+        name=name,
+        parts=[Part(root=TextPart(text=text))],
+    )
+
+
 class MaskAgentExecutor(AgentExecutor):
-    """Bridge MASK BaseAgent to A2A AgentExecutor.
+    """Bridge LangChain CompiledStateGraph or MASK BaseAgent to A2A AgentExecutor.
 
-    This executor wraps a MASK agent and handles the conversion between
-    A2A protocol messages and agent inputs/outputs.
+    This executor supports two agent types:
+    - LangChain CompiledStateGraph from create_agent() (recommended)
+    - MASK BaseAgent (legacy)
 
-    Following a2a-python-samples pattern:
-    - Extract user message from RequestContext
-    - Execute agent (with optional streaming)
-    - Enqueue results to EventQueue
+    Features:
+    - Real-time streaming via TaskArtifactUpdateEvent (default enabled)
+    - Multi-agent handoffs with context isolation
+    - OpenTelemetry tracing integration
 
     Example:
-        from mask.a2a import MaskAgentExecutor
+        from langchain.agents import create_agent
+        from mask.a2a import create_a2a_executor
 
-        executor = MaskAgentExecutor(my_agent)
-        # Used by A2A server internally
+        graph = create_agent(model, tools, system_prompt)
+        executor = create_a2a_executor(graph, server_name="my-agent")
     """
 
     def __init__(
         self,
-        agent: "BaseAgent",
-        stream: bool = False,
+        agent: Union["BaseAgent", "CompiledStateGraph"],
+        stream: bool = True,
         server_name: str = None,
     ) -> None:
-        """Initialize executor with MASK agent.
+        """Initialize executor with agent.
 
         Args:
-            agent: The BaseAgent instance to execute.
-            stream: Whether to use streaming responses.
-            server_name: A2A server name for trace display (e.g., "phase1-agent-github").
-                        If not provided, falls back to agent name.
+            agent: LangChain CompiledStateGraph or MASK BaseAgent instance.
+            stream: Whether to use real-time streaming (default True for Open WebUI).
+            server_name: A2A server name for trace display (e.g., "my-agent").
+                        If not provided, falls back to agent name attribute.
         """
         self.agent = agent
         self.stream = stream
         self.server_name = server_name
+        # Detect agent type: CompiledStateGraph has ainvoke but not invoke with session
+        self._is_graph = hasattr(agent, "ainvoke") and not hasattr(
+            agent, "invoke_with_session"
+        )
 
     async def execute(
         self,
@@ -93,6 +135,10 @@ class MaskAgentExecutor(AgentExecutor):
         # Extract handoff context for multi-agent coordination
         handoff_context = self._extract_handoff_context(context)
 
+        # Extract context_id and task_id for streaming events
+        context_id = self._extract_context_id(context)
+        task_id = self._extract_task_id(context)
+
         logger.debug(
             "Executing agent with message: %s... (session: %s, handoff: %s)",
             user_message[:50],
@@ -104,7 +150,12 @@ class MaskAgentExecutor(AgentExecutor):
         # This wraps the A2A infrastructure spans with a readable agent name
         try:
             await self._execute_with_tracing(
-                user_message, event_queue, session_id, handoff_context
+                user_message,
+                event_queue,
+                session_id,
+                handoff_context,
+                context_id,
+                task_id,
             )
         except Exception as e:
             logger.exception("Agent execution failed: %s", e)
@@ -118,6 +169,8 @@ class MaskAgentExecutor(AgentExecutor):
         event_queue: EventQueue,
         session_id: Optional[str] = None,
         handoff_context: Optional[HandoffContext] = None,
+        context_id: Optional[str] = None,
+        task_id: Optional[str] = None,
     ) -> None:
         """Execute agent with OpenTelemetry tracing.
 
@@ -175,15 +228,30 @@ class MaskAgentExecutor(AgentExecutor):
 
                         with using_session(session_id):
                             response_text = await self._execute_and_capture(
-                                message, event_queue, session_id, handoff_context
+                                message,
+                                event_queue,
+                                session_id,
+                                handoff_context,
+                                context_id,
+                                task_id,
                             )
                     except ImportError:
                         response_text = await self._execute_and_capture(
-                            message, event_queue, session_id, handoff_context
+                            message,
+                            event_queue,
+                            session_id,
+                            handoff_context,
+                            context_id,
+                            task_id,
                         )
                 else:
                     response_text = await self._execute_and_capture(
-                        message, event_queue, session_id, handoff_context
+                        message,
+                        event_queue,
+                        session_id,
+                        handoff_context,
+                        context_id,
+                        task_id,
                     )
 
                 # Set output after execution (multi-backend compatible)
@@ -193,12 +261,22 @@ class MaskAgentExecutor(AgentExecutor):
         except ImportError:
             logger.debug("OpenTelemetry not available, executing without tracing")
             await self._execute_and_capture(
-                message, event_queue, session_id, handoff_context
+                message,
+                event_queue,
+                session_id,
+                handoff_context,
+                context_id,
+                task_id,
             )
         except Exception as e:
             logger.warning("Tracing setup failed: %s, executing without tracing", e)
             await self._execute_and_capture(
-                message, event_queue, session_id, handoff_context
+                message,
+                event_queue,
+                session_id,
+                handoff_context,
+                context_id,
+                task_id,
             )
 
     async def _execute_and_capture(
@@ -207,19 +285,34 @@ class MaskAgentExecutor(AgentExecutor):
         event_queue: EventQueue,
         session_id: Optional[str] = None,
         handoff_context: Optional[HandoffContext] = None,
+        context_id: Optional[str] = None,
+        task_id: Optional[str] = None,
     ) -> str:
         """Execute agent and capture the response text.
+
+        Args:
+            message: User message to process.
+            event_queue: A2A event queue for sending responses.
+            session_id: Session ID for tracing.
+            handoff_context: Multi-agent handoff context.
+            context_id: A2A context ID for streaming events.
+            task_id: A2A task ID for streaming events.
 
         Returns:
             The response text from the agent.
         """
         if self.stream:
             return await self._execute_streaming_capture(
-                message, event_queue, session_id, handoff_context
+                message,
+                event_queue,
+                session_id,
+                handoff_context,
+                context_id,
+                task_id,
             )
         else:
             return await self._execute_non_streaming_capture(
-                message, event_queue, session_id, handoff_context
+                message, event_queue, session_id, handoff_context, context_id
             )
 
     async def _execute_non_streaming_capture(
@@ -228,11 +321,37 @@ class MaskAgentExecutor(AgentExecutor):
         event_queue: EventQueue,
         session_id: Optional[str] = None,
         handoff_context: Optional[HandoffContext] = None,
+        context_id: Optional[str] = None,
     ) -> str:
-        """Execute agent without streaming and capture response."""
-        response = await self.agent.invoke(
-            message, session_id=session_id, handoff_context=handoff_context
-        )
+        """Execute agent without streaming and capture response.
+
+        Supports both CompiledStateGraph and BaseAgent.
+        """
+        if self._is_graph:
+            # CompiledStateGraph: invoke({"messages": [HumanMessage(...)]})
+            from langchain_core.messages import HumanMessage
+
+            # Use context_id as thread_id for multi-turn conversation memory
+            thread_id = context_id or str(uuid.uuid4())
+            config = {"configurable": {"thread_id": thread_id}}
+
+            result = await self.agent.ainvoke(
+                {"messages": [HumanMessage(content=message)]},
+                config=config,
+            )
+            # Extract last AI message content
+            messages = result.get("messages", [])
+            response = ""
+            if messages:
+                last_msg = messages[-1]
+                if hasattr(last_msg, "content"):
+                    response = last_msg.content
+        else:
+            # BaseAgent: invoke(message, session_id=..., handoff_context=...)
+            response = await self.agent.invoke(
+                message, session_id=session_id, handoff_context=handoff_context
+            )
+
         await event_queue.enqueue_event(new_agent_text_message(response))
         return response
 
@@ -242,13 +361,137 @@ class MaskAgentExecutor(AgentExecutor):
         event_queue: EventQueue,
         session_id: Optional[str] = None,
         handoff_context: Optional[HandoffContext] = None,
+        context_id: Optional[str] = None,
+        task_id: Optional[str] = None,
     ) -> str:
-        """Execute agent with streaming and capture response."""
+        """Execute agent with real-time streaming via TaskArtifactUpdateEvent.
+
+        Sends each chunk immediately as it arrives, providing real-time feedback
+        for UI clients like Open WebUI.
+
+        Supports both CompiledStateGraph and BaseAgent.
+        """
         full_response = ""
-        async for chunk in self.agent.stream(
-            message, session_id=session_id, handoff_context=handoff_context
-        ):
-            full_response += chunk
+        artifact_id: Optional[str] = None
+
+        # Generate IDs if not provided
+        context_id = context_id or str(uuid.uuid4())
+        task_id = task_id or str(uuid.uuid4())
+
+        if self._is_graph:
+            # CompiledStateGraph: use astream with stream_mode="messages"
+            from langchain_core.messages import HumanMessage
+
+            # Use context_id as thread_id for multi-turn conversation memory
+            thread_id = context_id or str(uuid.uuid4())
+            config = {"configurable": {"thread_id": thread_id}}
+
+            async for event in self.agent.astream(
+                {"messages": [HumanMessage(content=message)]},
+                config=config,
+                stream_mode="messages",
+            ):
+                # Extract content from streaming events
+                if isinstance(event, tuple) and len(event) == 2:
+                    msg, metadata = event
+                    if hasattr(msg, "content") and msg.content:
+                        content = msg.content
+                        # Handle both str and list content types
+                        if isinstance(content, list):
+                            # Content blocks format: [{'text': '...', 'type': 'text', 'index': 0}]
+                            chunk = "".join(
+                                item.get("text", "") if isinstance(item, dict) else str(item)
+                                for item in content
+                            )
+                        else:
+                            chunk = str(content)
+
+                        if not chunk:
+                            continue
+
+                        full_response += chunk
+
+                        # Send chunk immediately via TaskArtifactUpdateEvent
+                        if artifact_id is None:
+                            # First chunk - generate artifact ID and create artifact
+                            artifact_id = str(uuid.uuid4())
+                            artifact = _create_text_artifact(artifact_id, "response", chunk)
+                            await event_queue.enqueue_event(
+                                TaskArtifactUpdateEvent(
+                                    artifact=artifact,
+                                    contextId=context_id,
+                                    taskId=task_id,
+                                    append=False,
+                                )
+                            )
+                        else:
+                            # Subsequent chunks - append using SAME artifact_id
+                            artifact = _create_text_artifact(artifact_id, "response", chunk)
+                            await event_queue.enqueue_event(
+                                TaskArtifactUpdateEvent(
+                                    artifact=artifact,
+                                    contextId=context_id,
+                                    taskId=task_id,
+                                    append=True,
+                                )
+                            )
+
+            # Send final chunk marker with same artifact_id
+            if artifact_id:
+                await event_queue.enqueue_event(
+                    TaskArtifactUpdateEvent(
+                        artifact=_create_text_artifact(artifact_id, "response", ""),
+                        contextId=context_id,
+                        taskId=task_id,
+                        append=True,
+                        lastChunk=True,
+                    )
+                )
+        else:
+            # BaseAgent: use stream() method
+            async for chunk in self.agent.stream(
+                message, session_id=session_id, handoff_context=handoff_context
+            ):
+                full_response += chunk
+
+                # Send chunk immediately via TaskArtifactUpdateEvent
+                if artifact_id is None:
+                    # First chunk - generate artifact ID and create artifact
+                    artifact_id = str(uuid.uuid4())
+                    artifact = _create_text_artifact(artifact_id, "response", chunk)
+                    await event_queue.enqueue_event(
+                        TaskArtifactUpdateEvent(
+                            artifact=artifact,
+                            contextId=context_id,
+                            taskId=task_id,
+                            append=False,
+                        )
+                    )
+                else:
+                    # Subsequent chunks - append using SAME artifact_id
+                    artifact = _create_text_artifact(artifact_id, "response", chunk)
+                    await event_queue.enqueue_event(
+                        TaskArtifactUpdateEvent(
+                            artifact=artifact,
+                            contextId=context_id,
+                            taskId=task_id,
+                            append=True,
+                        )
+                    )
+
+            # Send final chunk marker with same artifact_id
+            if artifact_id:
+                await event_queue.enqueue_event(
+                    TaskArtifactUpdateEvent(
+                        artifact=_create_text_artifact(artifact_id, "response", ""),
+                        contextId=context_id,
+                        taskId=task_id,
+                        append=True,
+                        lastChunk=True,
+                    )
+                )
+
+        # Also send final message for non-streaming clients
         await event_queue.enqueue_event(new_agent_text_message(full_response))
         return full_response
 
@@ -295,6 +538,43 @@ class MaskAgentExecutor(AgentExecutor):
             return context.context_id
 
         return None
+
+    def _extract_context_id(self, context: RequestContext) -> Optional[str]:
+        """Extract context ID from A2A request context for streaming events.
+
+        Args:
+            context: The request context.
+
+        Returns:
+            Context ID if found, generates a UUID otherwise.
+        """
+        message = context.message
+        if message:
+            if hasattr(message, "context_id") and message.context_id:
+                return message.context_id
+
+        if hasattr(context, "context_id") and context.context_id:
+            return context.context_id
+
+        return str(uuid.uuid4())
+
+    def _extract_task_id(self, context: RequestContext) -> Optional[str]:
+        """Extract task ID from A2A request context for streaming events.
+
+        Args:
+            context: The request context.
+
+        Returns:
+            Task ID if found, generates a UUID otherwise.
+        """
+        if hasattr(context, "task_id") and context.task_id:
+            return context.task_id
+
+        message = context.message
+        if message and hasattr(message, "task_id") and message.task_id:
+            return message.task_id
+
+        return str(uuid.uuid4())
 
     def _extract_handoff_context(
         self, context: RequestContext
