@@ -1,0 +1,70 @@
+# {{ project_name }} - Docker Compose Configuration
+#
+# Usage:
+#   docker-compose up              # Start all services
+#   docker-compose up agent        # Start only A2A agent
+#   docker-compose up --build      # Rebuild and start
+#   docker-compose logs -f         # Follow logs
+#
+# Services:
+#   - agent: A2A Protocol server (port 10001)
+#   - openai-wrapper: OpenAI-compatible API for Open WebUI (port 11434)
+
+services:
+  # A2A Protocol Agent Server
+  agent:
+    build:
+      context: .
+      target: production
+    container_name: {{ project_name }}-agent
+    ports:
+      - "10001:10001"
+    env_file:
+      - .env
+    environment:
+      - A2A_HOST=0.0.0.0
+      - A2A_PORT=10001
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:10001/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # OpenAI-Compatible Wrapper (for Open WebUI integration)
+  openai-wrapper:
+    build:
+      context: .
+      target: production
+    container_name: {{ project_name }}-openai
+    ports:
+      - "11434:11434"
+    env_file:
+      - .env
+    environment:
+      - A2A_HOST=agent
+      - A2A_PORT=10001
+      - OPENAI_COMPAT_HOST=0.0.0.0
+      - OPENAI_COMPAT_PORT=11434
+    depends_on:
+      agent:
+        condition: service_healthy
+    command: ["python", "-m", "{{ module_name }}.main_openai"]
+    restart: unless-stopped
+
+# Optional: Add Phoenix for observability
+# Uncomment the following to include Phoenix tracing:
+#
+#   phoenix:
+#     image: arizephoenix/phoenix:latest
+#     container_name: {{ project_name }}-phoenix
+#     ports:
+#       - "6006:6006"
+#     environment:
+#       - PHOENIX_WORKING_DIR=/data
+#     volumes:
+#       - phoenix_data:/data
+#
+# volumes:
+#   phoenix_data:
