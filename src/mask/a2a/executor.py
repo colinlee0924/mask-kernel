@@ -230,11 +230,20 @@ class MaskAgentExecutor(AgentExecutor):
                 context=Context(),  # Empty context = no parent = root span
                 attributes=span_attributes,
             ) as span:
+                # Log trace ID for debugging
+                trace_id = format(span.get_span_context().trace_id, '032x')
+                logger.info("[TRACING] Created span: name=%s, trace_id=%s, session_id=%s",
+                           span_name, trace_id, session_id)
+
                 # Use multi-backend attribute utilities for compatibility
                 # with Phoenix, Langfuse, and OpenTelemetry GenAI
                 set_span_io(span, input_value=message)
                 set_span_session(span, session_id=session_id, trace_name=span_name)
                 set_span_metadata(span, agent_name=agent_name, server_name=span_name)
+
+                # Log that session was set
+                if session_id:
+                    logger.info("[TRACING] Set session.id attribute: %s", session_id)
 
                 # Execute with session context for child spans
                 if session_id:
@@ -708,13 +717,22 @@ class MaskAgentExecutor(AgentExecutor):
         # Check message for context_id (from A2A Message.contextId)
         message = context.message
         if message:
-            if hasattr(message, "context_id") and message.context_id:
-                return message.context_id
+            context_id_value = getattr(message, "context_id", None)
+            logger.info(
+                "[SESSION] Extracting from message: context_id=%s, type=%s",
+                context_id_value,
+                type(context_id_value).__name__,
+            )
+            if context_id_value:
+                logger.info("[SESSION] Using message.context_id: %s", context_id_value)
+                return context_id_value
 
         # Fallback: check RequestContext for context_id
         if hasattr(context, "context_id") and context.context_id:
+            logger.info("[SESSION] Using context.context_id: %s", context.context_id)
             return context.context_id
 
+        logger.warning("[SESSION] No session_id found in context!")
         return None
 
     def _extract_context_id(self, context: RequestContext) -> Optional[str]:
