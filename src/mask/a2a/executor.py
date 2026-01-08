@@ -385,83 +385,19 @@ class MaskAgentExecutor(AgentExecutor):
         for UI clients like Open WebUI.
 
         Supports both CompiledStateGraph and BaseAgent.
+        Uses astream_events() for rich event streaming (thinking, tool calls, etc.)
         """
         full_response = ""
-        artifact_id: Optional[str] = None
 
         # Generate IDs if not provided
         context_id = context_id or str(uuid.uuid4())
         task_id = task_id or str(uuid.uuid4())
 
         if self._is_graph:
-            # CompiledStateGraph: use astream with stream_mode="messages"
-            from langchain_core.messages import HumanMessage
-
-            # Use context_id as thread_id for multi-turn conversation memory
-            thread_id = context_id or str(uuid.uuid4())
-            config = {"configurable": {"thread_id": thread_id}}
-
-            async for event in self.agent.astream(
-                {"messages": [HumanMessage(content=message)]},
-                config=config,
-                stream_mode="messages",
-            ):
-                # Extract content from streaming events
-                if isinstance(event, tuple) and len(event) == 2:
-                    msg, metadata = event
-                    if hasattr(msg, "content") and msg.content:
-                        content = msg.content
-                        # Handle both str and list content types
-                        if isinstance(content, list):
-                            # Content blocks format: [{'text': '...', 'type': 'text', 'index': 0}]
-                            chunk = "".join(
-                                item.get("text", "") if isinstance(item, dict) else str(item)
-                                for item in content
-                            )
-                        else:
-                            chunk = str(content)
-
-                        if not chunk:
-                            continue
-
-                        full_response += chunk
-
-                        # Send chunk immediately via TaskArtifactUpdateEvent
-                        if artifact_id is None:
-                            # First chunk - generate artifact ID and create artifact
-                            artifact_id = str(uuid.uuid4())
-                            artifact = _create_text_artifact(artifact_id, "response", chunk)
-                            await event_queue.enqueue_event(
-                                TaskArtifactUpdateEvent(
-                                    artifact=artifact,
-                                    contextId=context_id,
-                                    taskId=task_id,
-                                    append=False,
-                                )
-                            )
-                        else:
-                            # Subsequent chunks - append using SAME artifact_id
-                            artifact = _create_text_artifact(artifact_id, "response", chunk)
-                            await event_queue.enqueue_event(
-                                TaskArtifactUpdateEvent(
-                                    artifact=artifact,
-                                    contextId=context_id,
-                                    taskId=task_id,
-                                    append=True,
-                                )
-                            )
-
-            # Send final chunk marker with same artifact_id
-            if artifact_id:
-                await event_queue.enqueue_event(
-                    TaskArtifactUpdateEvent(
-                        artifact=_create_text_artifact(artifact_id, "response", ""),
-                        contextId=context_id,
-                        taskId=task_id,
-                        append=True,
-                        lastChunk=True,
-                    )
-                )
+            # CompiledStateGraph: use astream_events for rich streaming
+            full_response = await self._execute_rich_streaming(
+                message, event_queue, context_id, task_id
+            )
         else:
             # BaseAgent: use stream() method
             async for chunk in self.agent.stream(
@@ -508,6 +444,233 @@ class MaskAgentExecutor(AgentExecutor):
 
         # Also send final message for non-streaming clients
         await event_queue.enqueue_event(new_agent_text_message(full_response))
+        return full_response
+
+    async def _execute_rich_streaming(
+        self,
+        message: str,
+        event_queue: EventQueue,
+        context_id: str,
+        task_id: str,
+    ) -> str:
+        """Execute with rich streaming using astream_events().
+
+        Streams different event types for UI rendering:
+        - thinking: Model reasoning process (extended thinking)
+        - tool_call: Tool invocation with arguments
+        - tool_result: Tool execution result
+        - response: Final text response
+
+        Each event type uses a unique artifact_id for proper UI rendering.
+        """
+        from langchain_core.messages import HumanMessage
+
+        full_response = ""
+        thread_id = context_id or str(uuid.uuid4())
+        config = {"configurable": {"thread_id": thread_id}}
+
+        # Artifact IDs for different event types (reused for appending)
+        response_artifact_id: Optional[str] = None
+        thinking_artifact_id: Optional[str] = None
+        current_tool_artifact_id: Optional[str] = None
+
+        # Track tool calls for proper result matching
+        active_tool_calls: Dict[str, str] = {}  # run_id -> tool_name
+
+        async for event in self.agent.astream_events(
+            {"messages": [HumanMessage(content=message)]},
+            config=config,
+            version="v2",
+        ):
+            kind = event.get("event", "")
+            data = event.get("data", {})
+
+            # ===== Extended Thinking / Reasoning =====
+            if kind == "on_chat_model_stream":
+                chunk = data.get("chunk")
+                if chunk and hasattr(chunk, "content"):
+                    content = chunk.content
+
+                    # Check for thinking blocks (Claude extended thinking)
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict):
+                                block_type = block.get("type", "")
+
+                                # Thinking block (Claude extended thinking)
+                                if block_type == "thinking":
+                                    thinking_text = block.get("thinking", "")
+                                    if thinking_text:
+                                        if thinking_artifact_id is None:
+                                            thinking_artifact_id = str(uuid.uuid4())
+                                            artifact = _create_text_artifact(
+                                                thinking_artifact_id, "thinking", thinking_text
+                                            )
+                                            await event_queue.enqueue_event(
+                                                TaskArtifactUpdateEvent(
+                                                    artifact=artifact,
+                                                    contextId=context_id,
+                                                    taskId=task_id,
+                                                    append=False,
+                                                )
+                                            )
+                                        else:
+                                            artifact = _create_text_artifact(
+                                                thinking_artifact_id, "thinking", thinking_text
+                                            )
+                                            await event_queue.enqueue_event(
+                                                TaskArtifactUpdateEvent(
+                                                    artifact=artifact,
+                                                    contextId=context_id,
+                                                    taskId=task_id,
+                                                    append=True,
+                                                )
+                                            )
+
+                                # Text block (normal response)
+                                elif block_type == "text" or "text" in block:
+                                    text = block.get("text", "")
+                                    if text:
+                                        full_response += text
+                                        if response_artifact_id is None:
+                                            response_artifact_id = str(uuid.uuid4())
+                                            artifact = _create_text_artifact(
+                                                response_artifact_id, "response", text
+                                            )
+                                            await event_queue.enqueue_event(
+                                                TaskArtifactUpdateEvent(
+                                                    artifact=artifact,
+                                                    contextId=context_id,
+                                                    taskId=task_id,
+                                                    append=False,
+                                                )
+                                            )
+                                        else:
+                                            artifact = _create_text_artifact(
+                                                response_artifact_id, "response", text
+                                            )
+                                            await event_queue.enqueue_event(
+                                                TaskArtifactUpdateEvent(
+                                                    artifact=artifact,
+                                                    contextId=context_id,
+                                                    taskId=task_id,
+                                                    append=True,
+                                                )
+                                            )
+                    elif isinstance(content, str) and content:
+                        # Simple string content
+                        full_response += content
+                        if response_artifact_id is None:
+                            response_artifact_id = str(uuid.uuid4())
+                            artifact = _create_text_artifact(
+                                response_artifact_id, "response", content
+                            )
+                            await event_queue.enqueue_event(
+                                TaskArtifactUpdateEvent(
+                                    artifact=artifact,
+                                    contextId=context_id,
+                                    taskId=task_id,
+                                    append=False,
+                                )
+                            )
+                        else:
+                            artifact = _create_text_artifact(
+                                response_artifact_id, "response", content
+                            )
+                            await event_queue.enqueue_event(
+                                TaskArtifactUpdateEvent(
+                                    artifact=artifact,
+                                    contextId=context_id,
+                                    taskId=task_id,
+                                    append=True,
+                                )
+                            )
+
+            # ===== Tool Call Start =====
+            elif kind == "on_tool_start":
+                run_id = event.get("run_id", "")
+                tool_name = event.get("name", "unknown")
+                tool_input = data.get("input", {})
+
+                # Track this tool call
+                active_tool_calls[run_id] = tool_name
+
+                # Create tool_call artifact with input
+                current_tool_artifact_id = str(uuid.uuid4())
+                tool_info = json.dumps(
+                    {"tool": tool_name, "input": tool_input, "status": "running"},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                artifact = _create_text_artifact(
+                    current_tool_artifact_id, "tool_call", tool_info
+                )
+                await event_queue.enqueue_event(
+                    TaskArtifactUpdateEvent(
+                        artifact=artifact,
+                        contextId=context_id,
+                        taskId=task_id,
+                        append=False,
+                    )
+                )
+                logger.debug("Tool started: %s with input: %s", tool_name, tool_input)
+
+            # ===== Tool Call End =====
+            elif kind == "on_tool_end":
+                run_id = event.get("run_id", "")
+                tool_name = active_tool_calls.pop(run_id, "unknown")
+                output = data.get("output", "")
+
+                # Send tool_result artifact
+                result_artifact_id = str(uuid.uuid4())
+
+                # Handle different output types
+                if hasattr(output, "content"):
+                    output_str = str(output.content)
+                else:
+                    output_str = str(output) if output else ""
+
+                result_info = json.dumps(
+                    {"tool": tool_name, "output": output_str, "status": "completed"},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                artifact = _create_text_artifact(
+                    result_artifact_id, "tool_result", result_info
+                )
+                await event_queue.enqueue_event(
+                    TaskArtifactUpdateEvent(
+                        artifact=artifact,
+                        contextId=context_id,
+                        taskId=task_id,
+                        append=False,
+                    )
+                )
+                logger.debug("Tool completed: %s with output: %s...", tool_name, output_str[:100])
+
+        # Send final markers for active artifacts
+        if thinking_artifact_id:
+            await event_queue.enqueue_event(
+                TaskArtifactUpdateEvent(
+                    artifact=_create_text_artifact(thinking_artifact_id, "thinking", ""),
+                    contextId=context_id,
+                    taskId=task_id,
+                    append=True,
+                    lastChunk=True,
+                )
+            )
+
+        if response_artifact_id:
+            await event_queue.enqueue_event(
+                TaskArtifactUpdateEvent(
+                    artifact=_create_text_artifact(response_artifact_id, "response", ""),
+                    contextId=context_id,
+                    taskId=task_id,
+                    append=True,
+                    lastChunk=True,
+                )
+            )
+
         return full_response
 
     def _extract_user_message(self, context: RequestContext) -> str:
