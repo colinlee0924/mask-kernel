@@ -8,6 +8,7 @@ Supports:
 - MASK BaseAgent (legacy)
 - Real-time streaming via TaskArtifactUpdateEvent
 - Multi-agent handoffs with context isolation
+- Frontend Source of Truth pattern for Open WebUI integration
 
 Usage:
     from langchain.agents import create_agent
@@ -19,7 +20,7 @@ Usage:
 
 import logging
 import uuid
-from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
@@ -139,11 +140,16 @@ class MaskAgentExecutor(AgentExecutor):
         context_id = self._extract_context_id(context)
         task_id = self._extract_task_id(context)
 
+        # Extract frontend history for "Frontend Source of Truth" pattern
+        # This allows Open WebUI to control the conversation state
+        frontend_history = self._extract_frontend_history(context)
+
         logger.debug(
-            "Executing agent with message: %s... (session: %s, handoff: %s)",
+            "Executing agent with message: %s... (session: %s, handoff: %s, history: %d msgs)",
             user_message[:50],
             session_id or "none",
             handoff_context.parent_agent if handoff_context else "none",
+            len(frontend_history) if frontend_history else 0,
         )
 
         # Create a user-friendly root span for Phoenix display
@@ -156,6 +162,7 @@ class MaskAgentExecutor(AgentExecutor):
                 handoff_context,
                 context_id,
                 task_id,
+                frontend_history,
             )
         except Exception as e:
             logger.exception("Agent execution failed: %s", e)
@@ -171,6 +178,7 @@ class MaskAgentExecutor(AgentExecutor):
         handoff_context: Optional[HandoffContext] = None,
         context_id: Optional[str] = None,
         task_id: Optional[str] = None,
+        frontend_history: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Execute agent with OpenTelemetry tracing.
 
@@ -215,11 +223,20 @@ class MaskAgentExecutor(AgentExecutor):
                 context=Context(),  # Empty context = no parent = root span
                 attributes=span_attributes,
             ) as span:
+                # Log trace ID for debugging
+                trace_id = format(span.get_span_context().trace_id, '032x')
+                logger.info("[TRACING] Created span: name=%s, trace_id=%s, session_id=%s",
+                           span_name, trace_id, session_id)
+
                 # Use multi-backend attribute utilities for compatibility
                 # with Phoenix, Langfuse, and OpenTelemetry GenAI
                 set_span_io(span, input_value=message)
                 set_span_session(span, session_id=session_id, trace_name=span_name)
                 set_span_metadata(span, agent_name=agent_name, server_name=span_name)
+
+                # Log that session was set
+                if session_id:
+                    logger.info("[TRACING] Set session.id attribute: %s", session_id)
 
                 # Execute with session context for child spans
                 if session_id:
@@ -234,6 +251,7 @@ class MaskAgentExecutor(AgentExecutor):
                                 handoff_context,
                                 context_id,
                                 task_id,
+                                frontend_history,
                             )
                     except ImportError:
                         response_text = await self._execute_and_capture(
@@ -243,6 +261,7 @@ class MaskAgentExecutor(AgentExecutor):
                             handoff_context,
                             context_id,
                             task_id,
+                            frontend_history,
                         )
                 else:
                     response_text = await self._execute_and_capture(
@@ -252,6 +271,7 @@ class MaskAgentExecutor(AgentExecutor):
                         handoff_context,
                         context_id,
                         task_id,
+                        frontend_history,
                     )
 
                 # Set output after execution (multi-backend compatible)
@@ -267,6 +287,7 @@ class MaskAgentExecutor(AgentExecutor):
                 handoff_context,
                 context_id,
                 task_id,
+                frontend_history,
             )
         except Exception as e:
             logger.warning("Tracing setup failed: %s, executing without tracing", e)
@@ -277,6 +298,7 @@ class MaskAgentExecutor(AgentExecutor):
                 handoff_context,
                 context_id,
                 task_id,
+                frontend_history,
             )
 
     async def _execute_and_capture(
@@ -287,6 +309,7 @@ class MaskAgentExecutor(AgentExecutor):
         handoff_context: Optional[HandoffContext] = None,
         context_id: Optional[str] = None,
         task_id: Optional[str] = None,
+        frontend_history: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """Execute agent and capture the response text.
 
@@ -297,6 +320,7 @@ class MaskAgentExecutor(AgentExecutor):
             handoff_context: Multi-agent handoff context.
             context_id: A2A context ID for streaming events.
             task_id: A2A task ID for streaming events.
+            frontend_history: Full conversation history from frontend (Open WebUI).
 
         Returns:
             The response text from the agent.
@@ -309,10 +333,11 @@ class MaskAgentExecutor(AgentExecutor):
                 handoff_context,
                 context_id,
                 task_id,
+                frontend_history,
             )
         else:
             return await self._execute_non_streaming_capture(
-                message, event_queue, session_id, handoff_context, context_id
+                message, event_queue, session_id, handoff_context, context_id, frontend_history
             )
 
     async def _execute_non_streaming_capture(
@@ -322,21 +347,53 @@ class MaskAgentExecutor(AgentExecutor):
         session_id: Optional[str] = None,
         handoff_context: Optional[HandoffContext] = None,
         context_id: Optional[str] = None,
+        frontend_history: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """Execute agent without streaming and capture response.
 
         Supports both CompiledStateGraph and BaseAgent.
+
+        When frontend_history is provided (Frontend Source of Truth pattern),
+        it is used as the conversation history instead of relying on
+        LangGraph checkpoints.
         """
         if self._is_graph:
-            # CompiledStateGraph: invoke({"messages": [HumanMessage(...)]})
             from langchain_core.messages import HumanMessage
 
-            # Use context_id as thread_id for multi-turn conversation memory
-            thread_id = context_id or str(uuid.uuid4())
-            config = {"configurable": {"thread_id": thread_id}}
+            # Build messages to send to the agent
+            if frontend_history:
+                # Frontend Source of Truth: use provided history
+                # Convert to LangChain messages and add current user message
+                langchain_messages = self._convert_frontend_to_langchain_messages(
+                    frontend_history
+                )
+                # The current message should already be in frontend_history
+                # but ensure it's there
+                if not langchain_messages or (
+                    hasattr(langchain_messages[-1], "content")
+                    and langchain_messages[-1].content != message
+                ):
+                    langchain_messages.append(HumanMessage(content=message))
+
+                # Use a unique thread_id per request to avoid checkpoint conflicts
+                # Since we're using frontend as source of truth, we don't need
+                # to persist state in LangGraph checkpoints
+                thread_id = str(uuid.uuid4())
+                config = {"configurable": {"thread_id": thread_id}}
+
+                logger.debug(
+                    "Using frontend history with %d messages (stateless mode)",
+                    len(langchain_messages),
+                )
+            else:
+                # No frontend history - use checkpoint-based mode
+                # (original behavior for backward compatibility)
+                langchain_messages = [HumanMessage(content=message)]
+                thread_id = context_id or str(uuid.uuid4())
+                config = {"configurable": {"thread_id": thread_id}}
 
             result = await self.agent.ainvoke(
-                {"messages": [HumanMessage(content=message)]},
+                {"messages": langchain_messages},
                 config=config,
             )
             # Extract last AI message content
@@ -363,6 +420,7 @@ class MaskAgentExecutor(AgentExecutor):
         handoff_context: Optional[HandoffContext] = None,
         context_id: Optional[str] = None,
         task_id: Optional[str] = None,
+        frontend_history: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """Execute agent with real-time streaming via TaskArtifactUpdateEvent.
 
@@ -370,6 +428,10 @@ class MaskAgentExecutor(AgentExecutor):
         for UI clients like Open WebUI.
 
         Supports both CompiledStateGraph and BaseAgent.
+
+        When frontend_history is provided (Frontend Source of Truth pattern),
+        it is used as the conversation history instead of relying on
+        LangGraph checkpoints.
         """
         full_response = ""
         artifact_id: Optional[str] = None
@@ -382,12 +444,37 @@ class MaskAgentExecutor(AgentExecutor):
             # CompiledStateGraph: use astream with stream_mode="messages"
             from langchain_core.messages import HumanMessage
 
-            # Use context_id as thread_id for multi-turn conversation memory
-            thread_id = context_id or str(uuid.uuid4())
-            config = {"configurable": {"thread_id": thread_id}}
+            # Build messages to send to the agent
+            if frontend_history:
+                # Frontend Source of Truth: use provided history
+                langchain_messages = self._convert_frontend_to_langchain_messages(
+                    frontend_history
+                )
+                # Ensure current message is included
+                if not langchain_messages or (
+                    hasattr(langchain_messages[-1], "content")
+                    and langchain_messages[-1].content != message
+                ):
+                    langchain_messages.append(HumanMessage(content=message))
+
+                # Use context_id as thread_id for session grouping consistency
+                # Since we're in stateless mode (no checkpointer), same thread_id
+                # across requests is safe - each request builds fresh history
+                thread_id = context_id or str(uuid.uuid4())
+                config = {"configurable": {"thread_id": thread_id}}
+
+                logger.debug(
+                    "Streaming with frontend history: %d messages (stateless mode)",
+                    len(langchain_messages),
+                )
+            else:
+                # No frontend history - use checkpoint-based mode
+                langchain_messages = [HumanMessage(content=message)]
+                thread_id = context_id or str(uuid.uuid4())
+                config = {"configurable": {"thread_id": thread_id}}
 
             async for event in self.agent.astream(
-                {"messages": [HumanMessage(content=message)]},
+                {"messages": langchain_messages},
                 config=config,
                 stream_mode="messages",
             ):
@@ -530,13 +617,22 @@ class MaskAgentExecutor(AgentExecutor):
         # Check message for context_id (from A2A Message.contextId)
         message = context.message
         if message:
-            if hasattr(message, "context_id") and message.context_id:
-                return message.context_id
+            context_id_value = getattr(message, "context_id", None)
+            logger.info(
+                "[SESSION] Extracting from message: context_id=%s, type=%s",
+                context_id_value,
+                type(context_id_value).__name__,
+            )
+            if context_id_value:
+                logger.info("[SESSION] Using message.context_id: %s", context_id_value)
+                return context_id_value
 
         # Fallback: check RequestContext for context_id
         if hasattr(context, "context_id") and context.context_id:
+            logger.info("[SESSION] Using context.context_id: %s", context.context_id)
             return context.context_id
 
+        logger.warning("[SESSION] No session_id found in context!")
         return None
 
     def _extract_context_id(self, context: RequestContext) -> Optional[str]:
@@ -618,6 +714,85 @@ class MaskAgentExecutor(AgentExecutor):
             return HandoffContext.from_dict(handoff_data)
 
         return None
+
+    def _extract_frontend_history(
+        self, context: RequestContext
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Extract frontend message history from A2A request.
+
+        This implements the "Frontend Source of Truth" pattern where Open WebUI
+        sends the full conversation history, and we use that instead of relying
+        on LangGraph checkpoints.
+
+        The history is expected in message.metadata.history as a list of messages
+        in OpenAI format:
+        [
+            {"role": "user", "content": "..."},
+            {"role": "assistant", "content": "..."},
+            ...
+        ]
+
+        Args:
+            context: The request context.
+
+        Returns:
+            List of message dicts if found, None otherwise.
+        """
+        message = context.message
+        if not message:
+            return None
+
+        # Check message metadata for frontend history
+        metadata: Optional[Dict[str, Any]] = None
+        if hasattr(message, "metadata") and message.metadata:
+            metadata = message.metadata
+        elif hasattr(message, "root") and hasattr(message.root, "metadata"):
+            metadata = message.root.metadata
+
+        if not metadata:
+            return None
+
+        # Extract history from metadata
+        history = metadata.get("history") or metadata.get("messages")
+        if history and isinstance(history, list):
+            logger.debug(
+                "Extracted frontend history with %d messages", len(history)
+            )
+            return history
+
+        return None
+
+    def _convert_frontend_to_langchain_messages(
+        self, frontend_messages: List[Dict[str, Any]]
+    ) -> List[Any]:
+        """Convert frontend (OpenAI format) messages to LangChain messages.
+
+        This converts messages from Open WebUI format to LangChain format,
+        filtering out tool calls since Open WebUI doesn't preserve them.
+
+        Args:
+            frontend_messages: List of messages in OpenAI format.
+
+        Returns:
+            List of LangChain message objects.
+        """
+        from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+        langchain_messages = []
+
+        for msg in frontend_messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            if role == "user":
+                langchain_messages.append(HumanMessage(content=content))
+            elif role == "assistant":
+                langchain_messages.append(AIMessage(content=content))
+            elif role == "system":
+                langchain_messages.append(SystemMessage(content=content))
+            # Skip tool messages - Open WebUI doesn't preserve them
+
+        return langchain_messages
 
     async def cancel(
         self,
