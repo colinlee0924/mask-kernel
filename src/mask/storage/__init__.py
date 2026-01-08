@@ -4,6 +4,8 @@ This module provides storage backends for session persistence:
 - MemorySessionStore: In-memory storage (default)
 - RedisSessionStore: Redis-backed storage (requires mask-kernel[redis])
 - PostgreSQLSessionStore: PostgreSQL-backed storage (requires mask-kernel[postgresql])
+- TaskSyncStore: A2A task sync metadata storage (requires asyncpg)
+- TaskSyncMetadata: Metadata for tracking A2A task sync state
 """
 
 from mask.storage.base import SessionStore
@@ -15,6 +17,8 @@ __all__ = [
     "MemorySessionStore",
     "RedisSessionStore",
     "PostgreSQLSessionStore",
+    "TaskSyncStore",
+    "TaskSyncMetadata",
 ]
 
 
@@ -26,4 +30,10 @@ def __getattr__(name: str):
     elif name == "PostgreSQLSessionStore":
         from mask.storage.postgresql_store import PostgreSQLSessionStore
         return PostgreSQLSessionStore
+    elif name == "TaskSyncStore":
+        from mask.storage.task_sync import TaskSyncStore
+        return TaskSyncStore
+    elif name == "TaskSyncMetadata":
+        from mask.storage.task_sync import TaskSyncMetadata
+        return TaskSyncMetadata
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

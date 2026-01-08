@@ -365,6 +365,47 @@ server = MaskA2AServer(
 server.run(port=10001)
 ```
 
+### PostgreSQL Persistence Helpers
+
+MASK provides small helper functions for persistence, organized by domain:
+
+- `mask.checkpoints` - LangGraph checkpoint helpers (PostgresSaver, AsyncPostgresSaver)
+- `mask.a2a` - A2A protocol helpers (DatabaseTaskStore)
+
+```python
+# LangGraph checkpoints (from mask.checkpoints)
+from mask.checkpoints import setup_postgres_tables, create_async_checkpointer
+
+# A2A protocol (from mask.a2a)
+from mask.a2a import create_a2a_executor, create_database_task_store
+
+# 1. Initialize tables (sync, call once at startup)
+setup_postgres_tables(database_url)
+
+# 2. Create checkpointer (async, must be in async context)
+checkpointer = await create_async_checkpointer(database_url)
+
+# 3. Create agent with checkpointer
+agent = await create_agent(checkpointer=checkpointer)
+
+# 4. Create executor
+executor = create_a2a_executor(agent, server_name="my-agent")
+
+# 5. Create task store for A2A
+task_store = create_database_task_store(database_url)
+
+# 6. Build server with native A2A SDK
+handler = DefaultRequestHandler(agent_executor=executor, task_store=task_store)
+app = A2AStarletteApplication(agent_card=..., http_handler=handler)
+```
+
+**Database URL Format:**
+```
+DATABASE_URL=postgresql://user:password@localhost:5432/my_agent_db
+```
+
+Each project should use its own database (e.g., `my_agent_db`) for isolation.
+
 ### Multi-Agent Handoffs
 
 ```python
@@ -692,3 +733,11 @@ python -m my_agent.main
 # Start OpenAI wrapper (separate terminal)
 python -m my_agent.main_openai
 ```
+
+## Tips for 啟動 virtual environment
+在 "/Users/lizonglin/colin_ws/workspaces/ws_agentic_system/PROJECT_A/uat_v2" 目錄下
+```bash
+source ~/.venv/bin/activate
+uv pip install -e "/Users/lizonglin/colin_ws/workspaces/ws_agentic_system/PROJECT_A/mask-kernel"
+```
+我們一律都要用 uv venv 建立 virtual environment 並使用 uv pip install 安裝套件 啟動 python 應用程式 也一定要 cd 到對應目錄下 source .venv/bin/activate 再執行

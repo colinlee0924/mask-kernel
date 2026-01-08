@@ -17,6 +17,7 @@ Modules:
     - mask.loader: Skill loaders (SKILL.md, Python)
     - mask.session: Session management
     - mask.storage: Storage backends (Memory, Redis, PostgreSQL)
+    - mask.checkpoints: LangGraph checkpoint helpers (PostgreSQL)
     - mask.a2a: A2A Protocol integration
     - mask.mcp: MCP integration
     - mask.observability: OpenInference tracing

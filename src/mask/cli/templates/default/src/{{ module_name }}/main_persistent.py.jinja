@@ -1,0 +1,111 @@
+"""A2A Server with PostgreSQL persistence (Production version).
+
+This server uses:
+- DatabaseTaskStore for A2A task persistence
+- AsyncPostgresSaver for LangGraph checkpoint persistence
+
+Usage:
+    # First, set DATABASE_URL in .env or environment:
+    DATABASE_URL=postgresql://user:pass@localhost:5432/{{ module_name }}
+
+    # Then run:
+    python -m {{ module_name }}.main_persistent
+"""
+
+import asyncio
+import os
+from pathlib import Path
+
+import uvicorn
+from dotenv import load_dotenv
+from a2a.server.apps import A2AStarletteApplication
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.types import AgentCapabilities, AgentCard, AgentSkill
+
+# LangGraph checkpoint helpers - from checkpoints module
+from mask.checkpoints import create_async_checkpointer, setup_postgres_tables
+# A2A helpers - from a2a module
+from mask.a2a import create_a2a_executor, create_database_task_store
+from mask.observability import setup_openinference_tracing
+
+from {{ module_name }}.agent import create_agent
+
+# Load .env file from project root
+env_path = Path(__file__).parent.parent.parent / ".env"
+load_dotenv(env_path)
+
+
+async def setup_agent_with_persistence(database_url: str):
+    """Async setup for agent with PostgreSQL checkpointer."""
+    checkpointer = await create_async_checkpointer(database_url)
+    agent = await create_agent(checkpointer=checkpointer)
+    return agent, checkpointer
+
+
+def main():
+    """Start the A2A server with PostgreSQL persistence."""
+    # Setup Phoenix tracing
+    setup_openinference_tracing(
+        project_name=os.environ.get("PHOENIX_PROJECT_NAME", "{{ project_name }}"),
+        endpoint=os.environ.get("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006"),
+        api_key=os.environ.get("PHOENIX_API_KEY"),
+    )
+
+    # Configure server
+    host = os.environ.get("A2A_HOST", "0.0.0.0")
+    port = int(os.environ.get("A2A_PORT", "10001"))
+
+    # Database URL - each project should have its own database
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        print("ERROR: DATABASE_URL environment variable is required.")
+        print("Set it in .env or environment:")
+        print("  DATABASE_URL=postgresql://user:password@localhost:5432/{{ module_name }}")
+        return
+
+    print(f"Starting {{ project_name }} with PostgreSQL persistence...")
+    print(f"Database: {database_url.split('@')[1] if '@' in database_url else database_url}")
+
+    # Initialize PostgreSQL tables (sync, before async operations)
+    if not setup_postgres_tables(database_url):
+        print("WARNING: Failed to initialize PostgreSQL tables. Persistence may not work.")
+
+    # Create agent with async checkpointer
+    agent, checkpointer = asyncio.run(setup_agent_with_persistence(database_url))
+
+    # Create DatabaseTaskStore for A2A tasks
+    task_store = create_database_task_store(database_url)
+
+    # Create executor
+    executor = create_a2a_executor(agent, server_name="{{ project_name }}", stream=True)
+
+    # Build A2A server using native SDK
+    agent_card = AgentCard(
+        name="{{ project_name }}",
+        description="A MASK-powered agent with PostgreSQL persistence",
+        url=f"http://{host}:{port}/",
+        version="1.0.0",
+        skills=[
+            AgentSkill(
+                id="general",
+                name="General Assistant",
+                description="General purpose assistance with PostgreSQL persistence",
+                tags=["general"],
+            )
+        ],
+        capabilities=AgentCapabilities(streaming=True),
+        defaultInputModes=["text"],
+        defaultOutputModes=["text"],
+    )
+
+    handler = DefaultRequestHandler(agent_executor=executor, task_store=task_store)
+    app = A2AStarletteApplication(agent_card=agent_card, http_handler=handler)
+
+    persistence_status = "enabled" if checkpointer else "disabled"
+    print(f"Checkpoint persistence: {persistence_status}")
+    print(f"Server running on {host}:{port}...")
+    uvicorn.run(app.build(), host=host, port=port, log_level="info")
+
+
+if __name__ == "__main__":
+    main()
