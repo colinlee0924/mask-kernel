@@ -692,3 +692,11 @@ python -m my_agent.main
 # Start OpenAI wrapper (separate terminal)
 python -m my_agent.main_openai
 ```
+
+## Tips for 啟動 virtual environment
+在 "/Users/lizonglin/colin_ws/workspaces/ws_agentic_system/PROJECT_A/uat_v2" 目錄下
+```bash
+source ~/.venv/bin/activate
+uv pip install -e "/Users/lizonglin/colin_ws/workspaces/ws_agentic_system/PROJECT_A/mask-kernel"
+```
+我們一律都要用 uv venv 建立 virtual environment 並使用 uv pip install 安裝套件 啟動 python 應用程式 也一定要 cd 到對應目錄下 source .venv/bin/activate 再執行

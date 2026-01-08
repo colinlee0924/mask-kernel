@@ -5,6 +5,7 @@ enabling multi-agent ecosystems.
 
 Components:
 - create_a2a_executor: Helper function to create A2A executor (recommended)
+- create_persistent_a2a_server: Create A2A server with PostgreSQL persistence
 - create_openai_compat_app: Create OpenAI-compatible API wrapping A2A
 - run_openai_compat_server: Run OpenAI-compatible wrapper server
 - MaskA2AServer: Expose MASK agent as A2A remote service (deprecated)
@@ -14,7 +15,7 @@ Components:
 """
 
 from mask.a2a.executor import MaskAgentExecutor
-from mask.a2a.helpers import create_a2a_executor
+from mask.a2a.helpers import create_a2a_executor, create_persistent_a2a_server
 from mask.a2a.openai_compat import create_openai_compat_app, run_openai_compat_server
 from mask.a2a.remote_connection import RemoteAgentConnection, RemoteAgentRegistry
 from mask.a2a.server import MaskA2AServer
@@ -22,6 +23,7 @@ from mask.a2a.server import MaskA2AServer
 __all__ = [
     # Recommended helpers
     "create_a2a_executor",
+    "create_persistent_a2a_server",
     "create_openai_compat_app",
     "run_openai_compat_server",
     # Legacy (deprecated)

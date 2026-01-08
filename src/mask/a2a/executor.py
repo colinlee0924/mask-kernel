@@ -8,6 +8,8 @@ Supports:
 - MASK BaseAgent (legacy)
 - Real-time streaming via TaskArtifactUpdateEvent
 - Multi-agent handoffs with context isolation
+- PostgreSQL persistence via LangGraph checkpointer
+- Session history synchronization with frontend (Open WebUI)
 
 Usage:
     from langchain.agents import create_agent
@@ -17,9 +19,11 @@ Usage:
     executor = create_a2a_executor(graph, server_name="my-agent")
 """
 
+import hashlib
+import json
 import logging
 import uuid
-from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
@@ -34,9 +38,11 @@ from mask.observability.attributes import (
 )
 
 if TYPE_CHECKING:
+    from langgraph.checkpoint.base import BaseCheckpointSaver
     from langgraph.graph.state import CompiledStateGraph
 
     from mask.agent.base_agent import BaseAgent
+    from mask.storage.base import SessionStore
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +97,8 @@ class MaskAgentExecutor(AgentExecutor):
         agent: Union["BaseAgent", "CompiledStateGraph"],
         stream: bool = True,
         server_name: str = None,
+        checkpointer: Optional["BaseCheckpointSaver"] = None,
+        session_store: Optional["SessionStore"] = None,
     ) -> None:
         """Initialize executor with agent.
 
@@ -99,10 +107,17 @@ class MaskAgentExecutor(AgentExecutor):
             stream: Whether to use real-time streaming (default True for Open WebUI).
             server_name: A2A server name for trace display (e.g., "my-agent").
                         If not provided, falls back to agent name attribute.
+            checkpointer: Optional LangGraph checkpointer for persistence.
+                         If provided, enables session history persistence.
+            session_store: Optional MASK SessionStore for session metadata.
         """
         self.agent = agent
         self.stream = stream
         self.server_name = server_name
+        self.checkpointer = checkpointer
+        self.session_store = session_store
+        # Track last checkpoint_id for metadata injection
+        self._last_checkpoint_id: Optional[str] = None
         # Detect agent type: CompiledStateGraph has ainvoke but not invoke with session
         self._is_graph = hasattr(agent, "ainvoke") and not hasattr(
             agent, "invoke_with_session"
@@ -634,3 +649,317 @@ class MaskAgentExecutor(AgentExecutor):
         # MASK agents don't currently support cancellation
         # Just acknowledge the cancellation
         pass
+
+    # =========================================================================
+    # Persistence & Sync Methods (Frontend Source of Truth Pattern)
+    # =========================================================================
+
+    def _extract_full_history(
+        self, context: RequestContext
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Extract full message history from A2A request configuration.
+
+        The frontend (Open WebUI via Pipe Function) sends complete message
+        history in the configuration.fullHistory field. This is the "Frontend
+        Source of Truth" pattern.
+
+        Args:
+            context: The request context.
+
+        Returns:
+            List of message dictionaries if found, None otherwise.
+        """
+        message = context.message
+        if not message:
+            return None
+
+        # Check message metadata for fullHistory (from A2A configuration)
+        metadata: Optional[Dict[str, Any]] = None
+        if hasattr(message, "metadata") and message.metadata:
+            metadata = message.metadata
+        elif hasattr(message, "root") and hasattr(message.root, "metadata"):
+            metadata = message.root.metadata
+
+        if not metadata:
+            return None
+
+        # Extract fullHistory from configuration
+        config = metadata.get("configuration") or metadata
+        full_history = config.get("fullHistory") or config.get("full_history")
+
+        if isinstance(full_history, list):
+            return full_history
+
+        return None
+
+    def _extract_metadata_from_messages(
+        self, messages: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Extract LangGraph/A2A metadata from frontend messages.
+
+        Extracts checkpoint_id, thread_id, and task_id from message metadata
+        for sync detection and forking.
+
+        Args:
+            messages: List of message dictionaries from frontend.
+
+        Returns:
+            Dictionary with extracted metadata:
+            - last_checkpoint_id: Most recent checkpoint ID
+            - thread_id: Thread/session ID
+            - task_ids: List of task IDs
+        """
+        result = {
+            "last_checkpoint_id": None,
+            "thread_id": None,
+            "task_ids": [],
+        }
+
+        if not messages:
+            return result
+
+        # Iterate through messages to find metadata
+        for msg in reversed(messages):
+            metadata = msg.get("metadata", {})
+            if not metadata:
+                continue
+
+            # Extract checkpoint_id from assistant messages
+            if not result["last_checkpoint_id"]:
+                ckpt_id = metadata.get("langgraph_checkpoint_id")
+                if ckpt_id:
+                    result["last_checkpoint_id"] = ckpt_id
+
+            # Extract thread_id
+            if not result["thread_id"]:
+                tid = metadata.get("langgraph_thread_id")
+                if tid:
+                    result["thread_id"] = tid
+
+            # Collect task_ids
+            task_id = metadata.get("a2a_task_id")
+            if task_id and task_id not in result["task_ids"]:
+                result["task_ids"].append(task_id)
+
+        return result
+
+    def _inject_metadata_to_response(
+        self,
+        response_text: str,
+        checkpoint_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create response with injected metadata for frontend tracking.
+
+        Injects LangGraph checkpoint_id, thread_id, and A2A task_id into
+        the response metadata. Frontend can use these IDs for sync operations.
+
+        Args:
+            response_text: The response content.
+            checkpoint_id: LangGraph checkpoint ID.
+            thread_id: LangGraph thread ID.
+            task_id: A2A task ID.
+
+        Returns:
+            Response dictionary with metadata.
+        """
+        metadata = {}
+        if checkpoint_id:
+            metadata["langgraph_checkpoint_id"] = checkpoint_id
+        if thread_id:
+            metadata["langgraph_thread_id"] = thread_id
+        if task_id:
+            metadata["a2a_task_id"] = task_id
+
+        return {
+            "role": "assistant",
+            "content": response_text,
+            "metadata": metadata if metadata else None,
+        }
+
+    def _compute_messages_hash(self, messages: List[Dict[str, Any]]) -> str:
+        """Compute hash of message contents for change detection.
+
+        Args:
+            messages: List of message dictionaries.
+
+        Returns:
+            SHA-256 hash of message contents.
+        """
+        # Extract content from messages for hashing
+        contents = []
+        for msg in messages:
+            content = msg.get("content", "")
+            role = msg.get("role", "")
+            contents.append(f"{role}:{content}")
+
+        hash_input = "\n".join(contents)
+        return hashlib.sha256(hash_input.encode("utf-8")).hexdigest()
+
+    def _detect_regenerate(
+        self,
+        frontend_messages: List[Dict[str, Any]],
+        last_checkpoint_id: Optional[str],
+    ) -> bool:
+        """Detect if this is a regenerate (retry) request.
+
+        A regenerate is detected when:
+        1. Frontend sends same user message as before
+        2. The last message is a user message (assistant response was deleted)
+
+        Args:
+            frontend_messages: Messages from frontend.
+            last_checkpoint_id: Last checkpoint ID from frontend metadata.
+
+        Returns:
+            True if this appears to be a regenerate request.
+        """
+        if not frontend_messages:
+            return False
+
+        # If frontend provides a checkpoint_id that's not the latest,
+        # and the last message is from user, it's likely a regenerate
+        last_msg = frontend_messages[-1]
+        if last_msg.get("role") == "user":
+            # Check if we have a checkpoint_id that indicates time travel
+            if last_checkpoint_id:
+                logger.debug(
+                    "Potential regenerate detected: user message with checkpoint_id %s",
+                    last_checkpoint_id,
+                )
+                return True
+
+        return False
+
+    def _detect_deletion(
+        self,
+        frontend_messages: List[Dict[str, Any]],
+        backend_messages: List[Dict[str, Any]],
+    ) -> List[str]:
+        """Detect deleted messages by comparing frontend and backend.
+
+        Args:
+            frontend_messages: Messages from frontend (source of truth).
+            backend_messages: Messages from LangGraph checkpoint.
+
+        Returns:
+            List of message IDs that were deleted.
+        """
+        if not backend_messages:
+            return []
+
+        # Build set of frontend message hashes
+        frontend_hashes = set()
+        for msg in frontend_messages:
+            content = msg.get("content", "")
+            role = msg.get("role", "")
+            frontend_hashes.add(f"{role}:{content[:100]}")
+
+        # Find backend messages not in frontend
+        deleted_ids = []
+        for msg in backend_messages:
+            content = msg.get("content", "") if isinstance(msg, dict) else ""
+            role = msg.get("role", "") if isinstance(msg, dict) else ""
+            msg_hash = f"{role}:{content[:100]}"
+            if msg_hash not in frontend_hashes:
+                msg_id = msg.get("id") if isinstance(msg, dict) else None
+                if msg_id:
+                    deleted_ids.append(msg_id)
+
+        return deleted_ids
+
+    async def _get_checkpoint_messages(
+        self, thread_id: str
+    ) -> List[Dict[str, Any]]:
+        """Get messages from LangGraph checkpoint.
+
+        Args:
+            thread_id: The thread ID to query.
+
+        Returns:
+            List of messages from checkpoint.
+        """
+        if not self._is_graph or not self.checkpointer:
+            return []
+
+        try:
+            config = {"configurable": {"thread_id": thread_id}}
+            state = await self.agent.aget_state(config)
+            if state and state.values:
+                messages = state.values.get("messages", [])
+                # Convert LangChain messages to dicts
+                result = []
+                for msg in messages:
+                    if hasattr(msg, "content"):
+                        result.append({
+                            "role": getattr(msg, "type", "unknown"),
+                            "content": msg.content,
+                            "id": getattr(msg, "id", None),
+                        })
+                return result
+        except Exception as e:
+            logger.warning("Failed to get checkpoint messages: %s", e)
+
+        return []
+
+    async def _sync_to_checkpoint(
+        self,
+        thread_id: str,
+        frontend_messages: List[Dict[str, Any]],
+        parent_checkpoint_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Sync frontend messages to LangGraph checkpoint.
+
+        Uses update_state to reshape checkpoint to match frontend state.
+
+        Args:
+            thread_id: The thread ID.
+            frontend_messages: Messages from frontend.
+            parent_checkpoint_id: Optional checkpoint to fork from.
+
+        Returns:
+            New checkpoint ID if sync was performed, None otherwise.
+        """
+        if not self._is_graph:
+            return None
+
+        try:
+            from langchain_core.messages import AIMessage, HumanMessage
+
+            # Convert frontend messages to LangChain format
+            lc_messages = []
+            for msg in frontend_messages:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if role == "user" or role == "human":
+                    lc_messages.append(HumanMessage(content=content))
+                elif role == "assistant" or role == "ai":
+                    lc_messages.append(AIMessage(content=content))
+
+            # Build config with optional checkpoint_id for forking
+            config = {"configurable": {"thread_id": thread_id}}
+            if parent_checkpoint_id:
+                config["configurable"]["checkpoint_id"] = parent_checkpoint_id
+
+            # Update state to match frontend
+            await self.agent.aupdate_state(
+                config,
+                values={"messages": lc_messages},
+            )
+
+            logger.info(
+                "Synced checkpoint for thread %s (parent: %s)",
+                thread_id,
+                parent_checkpoint_id,
+            )
+
+            # Get new checkpoint ID
+            new_state = await self.agent.aget_state(config)
+            if new_state and new_state.config:
+                return new_state.config.get("configurable", {}).get("checkpoint_id")
+
+        except Exception as e:
+            logger.exception("Failed to sync checkpoint: %s", e)
+
+        return None
