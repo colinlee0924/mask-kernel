@@ -1,4 +1,11 @@
-"""A2A Server using native a2a-sdk + MASK helpers."""
+"""A2A Server using native a2a-sdk + MASK helpers (InMemory version).
+
+This is the simple version for local development without database dependencies.
+For production with PostgreSQL persistence, use main_persistent.py instead.
+
+Usage:
+    python -m {{ module_name }}.main
+"""
 
 import asyncio
 import os
@@ -27,7 +34,7 @@ async def setup_agent():
 
 
 def main():
-    """Start the A2A server."""
+    """Start the A2A server (InMemory - for local development)."""
     # Setup Phoenix tracing
     setup_openinference_tracing(
         project_name=os.environ.get("PHOENIX_PROJECT_NAME", "{{ project_name }}"),
@@ -65,7 +72,7 @@ def main():
         defaultOutputModes=["text"],
     )
 
-    # Create request handler
+    # Create request handler (InMemory - no database required)
     handler = DefaultRequestHandler(
         agent_executor=executor,
         task_store=InMemoryTaskStore(),
@@ -77,7 +84,8 @@ def main():
         http_handler=handler,
     )
 
-    print(f"Starting {{ project_name }} on {host}:{port}...")
+    print(f"Starting {{ project_name }} on {host}:{port}... (InMemory mode)")
+    print("Note: For production with persistence, use: python -m {{ module_name }}.main_persistent")
     uvicorn.run(app.build(), host=host, port=port, log_level="info")
 
 

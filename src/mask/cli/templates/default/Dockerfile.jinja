@@ -77,6 +77,7 @@ EXPOSE 10001 11434
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:${A2A_PORT}/.well-known/agent.json || exit 1
 
-# Default command - run A2A agent
-# Override with: docker run ... python -m {{ module_name }}.main_openai
-CMD ["python", "-m", "{{ module_name }}.main"]
+# Default command - run A2A agent with PostgreSQL persistence
+# For local development without DB: docker run ... python -m {{ module_name }}.main
+# For OpenAI wrapper: docker run ... python -m {{ module_name }}.main_openai
+CMD ["python", "-m", "{{ module_name }}.main_persistent"]

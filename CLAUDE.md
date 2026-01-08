@@ -365,6 +365,47 @@ server = MaskA2AServer(
 server.run(port=10001)
 ```
 
+### PostgreSQL Persistence Helpers
+
+MASK provides small helper functions for persistence, organized by domain:
+
+- `mask.checkpoints` - LangGraph checkpoint helpers (PostgresSaver, AsyncPostgresSaver)
+- `mask.a2a` - A2A protocol helpers (DatabaseTaskStore)
+
+```python
+# LangGraph checkpoints (from mask.checkpoints)
+from mask.checkpoints import setup_postgres_tables, create_async_checkpointer
+
+# A2A protocol (from mask.a2a)
+from mask.a2a import create_a2a_executor, create_database_task_store
+
+# 1. Initialize tables (sync, call once at startup)
+setup_postgres_tables(database_url)
+
+# 2. Create checkpointer (async, must be in async context)
+checkpointer = await create_async_checkpointer(database_url)
+
+# 3. Create agent with checkpointer
+agent = await create_agent(checkpointer=checkpointer)
+
+# 4. Create executor
+executor = create_a2a_executor(agent, server_name="my-agent")
+
+# 5. Create task store for A2A
+task_store = create_database_task_store(database_url)
+
+# 6. Build server with native A2A SDK
+handler = DefaultRequestHandler(agent_executor=executor, task_store=task_store)
+app = A2AStarletteApplication(agent_card=..., http_handler=handler)
+```
+
+**Database URL Format:**
+```
+DATABASE_URL=postgresql://user:password@localhost:5432/my_agent_db
+```
+
+Each project should use its own database (e.g., `my_agent_db`) for isolation.
+
 ### Multi-Agent Handoffs
 
 ```python

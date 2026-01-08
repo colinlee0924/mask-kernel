@@ -1,6 +1,6 @@
 # {{ project_name }}
 
-A MASK agent project.
+A MASK agent project with A2A Protocol support.
 
 ## Installation
 
@@ -16,24 +16,51 @@ pip install -e .
 
 ## Running
 
-### Local Development
+### Local Development (InMemory - No Database Required)
 
 ```bash
-# Start A2A agent server
+# Start A2A agent server (InMemory mode - quick start)
 python -m {{ module_name }}.main
 
 # In another terminal, start OpenAI-compatible wrapper (optional, for Open WebUI)
 python -m {{ module_name }}.main_openai
 ```
 
-### With Docker
+### Production (PostgreSQL Persistence)
+
+For production deployments with conversation persistence:
+
+1. **Configure DATABASE_URL** in `.env`:
+   ```bash
+   DATABASE_URL=postgresql://user:password@localhost:5432/{{ module_name }}
+   ```
+
+2. **Create the database**:
+   ```bash
+   createdb {{ module_name }}
+   ```
+
+3. **Start with persistence**:
+   ```bash
+   python -m {{ module_name }}.main_persistent
+   ```
+
+> **Note:** The persistent version uses PostgreSQL for both LangGraph checkpoints and A2A task storage.
+
+### With Docker (Production)
+
+Docker defaults to PostgreSQL persistence mode. Requires `DATABASE_URL` in `.env`.
 
 ```bash
 # Build the image
 docker build -t {{ project_name }} .
 
-# Run A2A agent
+# Run A2A agent (uses main_persistent.py by default)
 docker run -p 10001:10001 --env-file .env {{ project_name }}
+
+# Or run in InMemory mode for testing
+docker run -p 10001:10001 --env-file .env {{ project_name }} \
+    python -m {{ module_name }}.main
 
 # Or run OpenAI wrapper
 docker run -p 11434:11434 --env-file .env {{ project_name }} \
@@ -67,6 +94,20 @@ After starting with Docker Compose, configure Open WebUI:
    - API Key: `sk-dummy` (any value)
 3. Select "{{ project_name }}" in the model dropdown
 
+## Database Setup (For Persistent Mode Only)
+
+When using `main_persistent.py` or Docker (which defaults to persistent mode), you need PostgreSQL:
+
+```bash
+# Using psql
+createdb {{ module_name }}
+
+# Or with Docker
+docker exec -it your-postgres-container psql -U postgres -c "CREATE DATABASE {{ module_name }};"
+```
+
+Tables are created automatically on first run. See [Persistence Details](#persistence-details) for more info.
+
 ## Development
 
 ```bash
@@ -78,13 +119,14 @@ pytest
 
 ```
 {{ project_name }}/
-├── .env.example              # Environment template
-├── Dockerfile                # Multi-stage Docker build
+├── .env.example              # Environment template (includes DATABASE_URL)
+├── Dockerfile                # Multi-stage Docker build (defaults to persistent mode)
 ├── docker-compose.yml        # Run A2A + OpenAI wrapper
 ├── pyproject.toml
 ├── src/{{ module_name }}/
 │   ├── agent.py              # Agent configuration
-│   ├── main.py               # A2A server entry point
+│   ├── main.py               # A2A server (InMemory - for local dev)
+│   ├── main_persistent.py    # A2A server (PostgreSQL - for production)
 │   ├── main_openai.py        # OpenAI wrapper entry point
 │   ├── prompts/system.md     # System prompt
 │   ├── skills/               # Progressive Disclosure skills
@@ -92,3 +134,10 @@ pytest
 │   └── config/               # MCP server configuration
 └── tests/
 ```
+
+## Persistence Details
+
+| Component | Storage | Helper |
+|-----------|---------|--------|
+| LangGraph Checkpoints | `checkpoints` table | `mask.checkpoints` |
+| A2A Tasks | `tasks` table | `mask.a2a.create_database_task_store()` |

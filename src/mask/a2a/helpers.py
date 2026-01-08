@@ -7,42 +7,49 @@ Usage:
     from langchain.agents import create_agent
     from a2a.server.apps import A2AStarletteApplication
     from a2a.server.request_handlers import DefaultRequestHandler
+    from a2a.server.tasks import InMemoryTaskStore
     from mask.a2a import create_a2a_executor
 
     graph = create_agent(model, tools, system_prompt)
     executor = create_a2a_executor(graph, server_name="my-agent")
-    handler = DefaultRequestHandler(agent_executor=executor, task_store=...)
+    handler = DefaultRequestHandler(agent_executor=executor, task_store=InMemoryTaskStore())
     app = A2AStarletteApplication(agent_card, http_handler=handler)
 
 For persistent storage with PostgreSQL:
-    from mask.a2a import create_a2a_executor, create_persistent_a2a_server
+    # Use mask.checkpoints for LangGraph checkpointer
+    from mask.checkpoints import setup_postgres_tables, create_async_checkpointer
+    # Use mask.a2a for A2A task store
+    from mask.a2a import create_a2a_executor, create_database_task_store
 
-    # Create executor with persistence
-    executor = create_a2a_executor(
-        graph,
-        server_name="my-agent",
-        checkpointer=PostgresSaver.from_conn_string(DATABASE_URL),
-    )
+    # Initialize tables and create checkpointer
+    setup_postgres_tables(database_url)
+    checkpointer = await create_async_checkpointer(database_url)
 
-    # Or use the all-in-one helper
-    app = create_persistent_a2a_server(
-        agent=graph,
-        name="my-agent",
-        database_url="postgresql://user:pass@localhost:5432/mask_kernel",
-    )
+    # Create agent with checkpointer
+    agent = await create_agent(checkpointer=checkpointer)
+
+    # Create executor and task store
+    executor = create_a2a_executor(agent, server_name="my-agent")
+    task_store = create_database_task_store(database_url)
+
+    # Build server with native SDK
+    handler = DefaultRequestHandler(agent_executor=executor, task_store=task_store)
+    app = A2AStarletteApplication(agent_card, http_handler=handler)
 """
 
-from typing import TYPE_CHECKING, List, Optional, Union
+import logging
+from typing import TYPE_CHECKING, Optional, Union
 
 if TYPE_CHECKING:
-    from a2a.server.apps import A2AStarletteApplication
-    from a2a.types import AgentSkill
+    from a2a.server.tasks import TaskStore
     from langgraph.checkpoint.base import BaseCheckpointSaver
     from langgraph.graph.state import CompiledStateGraph
 
     from mask.a2a.executor import MaskAgentExecutor
     from mask.agent.base_agent import BaseAgent
     from mask.storage.base import SessionStore
+
+logger = logging.getLogger(__name__)
 
 
 def create_a2a_executor(
@@ -120,102 +127,32 @@ def create_a2a_executor(
     )
 
 
-def create_persistent_a2a_server(
-    agent: Union["BaseAgent", "CompiledStateGraph"],
-    name: str,
-    description: str,
-    database_url: str,
-    url: Optional[str] = None,
-    version: str = "1.0.0",
-    skills: Optional[List["AgentSkill"]] = None,
-    stream: bool = True,
-    default_input_modes: Optional[List[str]] = None,
-    default_output_modes: Optional[List[str]] = None,
-) -> "A2AStarletteApplication":
-    """Create an A2A server with PostgreSQL persistence.
+def create_database_task_store(database_url: str) -> "TaskStore":
+    """Create DatabaseTaskStore for A2A task persistence.
 
-    This helper creates a complete A2A server with:
-    - DatabaseTaskStore for A2A task persistence
-    - PostgresSaver for LangGraph checkpoint persistence
-    - Automatic schema creation
-
-    Three-layer storage architecture:
-    1. DatabaseTaskStore (A2A tasks) - schema: a2a
-    2. PostgresSaver (LangGraph checkpoints) - schema: langgraph
-    3. SessionStore (MASK sessions) - schema: mask
+    This helper creates a DatabaseTaskStore backed by PostgreSQL for
+    persisting A2A tasks across server restarts. Falls back to
+    InMemoryTaskStore if dependencies are not available.
 
     Args:
-        agent: LangChain CompiledStateGraph or MASK BaseAgent instance.
-        name: Agent name for AgentCard.
-        description: Agent description for AgentCard.
         database_url: PostgreSQL connection URL.
-            Example: "postgresql://user:pass@localhost:5432/mask_kernel"
-        url: Agent URL (auto-generated from host:port if not provided).
-        version: Agent version string.
-        skills: List of AgentSkill for AgentCard. If not provided, creates
-            a default "general" skill.
-        stream: Whether to enable streaming responses (default True).
-        default_input_modes: Supported input modes (default: ["text"]).
-        default_output_modes: Supported output modes (default: ["text"]).
+            Example: "postgresql://user:pass@localhost:5432/my_agent"
 
     Returns:
-        A2AStarletteApplication instance ready for uvicorn.run().
+        DatabaseTaskStore instance or InMemoryTaskStore as fallback.
 
     Example:
-        from mask.a2a import create_persistent_a2a_server
-        from langchain.agents import create_agent
-        import uvicorn
+        from mask.a2a import create_database_task_store
 
-        graph = create_agent(model, tools, system_prompt)
-
-        app = create_persistent_a2a_server(
-            agent=graph,
-            name="my-agent",
-            description="My persistent agent",
-            database_url="postgresql://user:pass@localhost:5432/mask_kernel",
+        task_store = create_database_task_store(
+            "postgresql://user:pass@localhost:5432/my_agent"
         )
 
-        uvicorn.run(app.build(), host="0.0.0.0", port=10001)
+        handler = DefaultRequestHandler(
+            agent_executor=executor,
+            task_store=task_store,
+        )
     """
-    import logging
-
-    from a2a.server.apps import A2AStarletteApplication
-    from a2a.server.request_handlers import DefaultRequestHandler
-    from a2a.types import AgentCapabilities, AgentCard, AgentSkill
-
-    logger = logging.getLogger(__name__)
-
-    # Create PostgresSaver for LangGraph checkpoints
-    # Note: from_conn_string() returns a context manager, so for long-running servers
-    # we use psycopg_pool.ConnectionPool directly
-    try:
-        from langgraph.checkpoint.postgres import PostgresSaver
-        from psycopg import connect
-        from psycopg_pool import ConnectionPool
-
-        # First, run setup with autocommit=True to allow CREATE INDEX CONCURRENTLY
-        # This needs to be outside a transaction block
-        with connect(database_url, autocommit=True) as setup_conn:
-            temp_saver = PostgresSaver(setup_conn)
-            temp_saver.setup()
-        logger.info("PostgresSaver tables initialized (schema created)")
-
-        # Create connection pool for long-running server
-        pool = ConnectionPool(conninfo=database_url)
-        checkpointer = PostgresSaver(pool)
-        logger.info("Created PostgresSaver checkpointer for LangGraph")
-    except ImportError as e:
-        logger.warning(
-            "langgraph-checkpoint-postgres or psycopg not installed. "
-            "Install with: pip install langgraph-checkpoint-postgres psycopg[pool]. Error: %s",
-            e,
-        )
-        checkpointer = None
-    except Exception as e:
-        logger.warning("Failed to create PostgresSaver: %s", e)
-        checkpointer = None
-
-    # Create DatabaseTaskStore for A2A tasks
     try:
         from a2a.server.tasks import DatabaseTaskStore
         from sqlalchemy.ext.asyncio import create_async_engine
@@ -230,69 +167,22 @@ def create_persistent_a2a_server(
         engine = create_async_engine(async_url)
         task_store = DatabaseTaskStore(engine=engine, create_table=True)
         logger.info("Created DatabaseTaskStore for A2A tasks")
+        return task_store
     except ImportError as e:
         logger.warning(
-            "a2a DatabaseTaskStore dependencies not available: %s. "
-            "Using InMemoryTaskStore. Tasks will not persist across restarts.",
+            "DatabaseTaskStore dependencies not available: %s. "
+            "Install with: pip install sqlalchemy asyncpg. "
+            "Using InMemoryTaskStore as fallback.",
             e,
         )
         from a2a.server.tasks import InMemoryTaskStore
 
-        task_store = InMemoryTaskStore()
+        return InMemoryTaskStore()
     except Exception as e:
-        logger.warning("Failed to create DatabaseTaskStore: %s. Using InMemory.", e)
+        logger.warning(
+            "Failed to create DatabaseTaskStore: %s. Using InMemoryTaskStore.",
+            e,
+        )
         from a2a.server.tasks import InMemoryTaskStore
 
-        task_store = InMemoryTaskStore()
-
-    # Create executor with persistence
-    executor = create_a2a_executor(
-        agent=agent,
-        stream=stream,
-        server_name=name,
-        checkpointer=checkpointer,
-    )
-
-    # Create default skill if not provided
-    if not skills:
-        skills = [
-            AgentSkill(
-                id="general",
-                name="General Assistant",
-                description=description,
-                tags=["general"],
-            )
-        ]
-
-    # Create agent card
-    agent_card = AgentCard(
-        name=name,
-        description=description,
-        url=url or "http://localhost:10001/",
-        version=version,
-        skills=skills,
-        capabilities=AgentCapabilities(streaming=stream),
-        defaultInputModes=default_input_modes or ["text"],
-        defaultOutputModes=default_output_modes or ["text"],
-    )
-
-    # Create request handler
-    handler = DefaultRequestHandler(
-        agent_executor=executor,
-        task_store=task_store,
-    )
-
-    # Create application
-    app = A2AStarletteApplication(
-        agent_card=agent_card,
-        http_handler=handler,
-    )
-
-    logger.info(
-        "Created persistent A2A server: name=%s, url=%s, persistence=%s",
-        name,
-        agent_card.url,
-        "enabled" if checkpointer else "disabled",
-    )
-
-    return app
+        return InMemoryTaskStore()

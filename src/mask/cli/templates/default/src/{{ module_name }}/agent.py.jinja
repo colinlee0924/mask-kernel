@@ -1,8 +1,10 @@
 """Agent configuration using LangChain create_agent + MASK SkillMiddleware."""
 
 from pathlib import Path
+from typing import Optional
 
 from langchain.agents import create_agent as langchain_create_agent
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 
 from mask.core import SkillRegistry
@@ -21,7 +23,10 @@ def load_system_prompt() -> str:
     return "You are a helpful assistant."
 
 
-async def create_agent(tier: ModelTier = ModelTier.THINKING):
+async def create_agent(
+    tier: ModelTier = ModelTier.THINKING,
+    checkpointer: Optional[BaseCheckpointSaver] = None,
+):
     """Create agent using LangChain + MASK SkillMiddleware.
 
     This uses the native LangChain create_agent API with MASK's
@@ -29,6 +34,9 @@ async def create_agent(tier: ModelTier = ModelTier.THINKING):
 
     Args:
         tier: Model capability tier to use.
+        checkpointer: Optional checkpoint saver for persistence.
+            If None, uses MemorySaver (in-memory).
+            For production, pass AsyncPostgresSaver from mask.checkpoints.
 
     Returns:
         LangChain agent with Progressive Disclosure support.
@@ -60,9 +68,9 @@ async def create_agent(tier: ModelTier = ModelTier.THINKING):
     # (not filtered by skill state)
     middleware = SkillMiddleware(registry, additional_tools=tools)
 
-    # Create checkpointer for multi-turn conversation memory
-    # Uses in-memory storage; for production, consider PostgresSaver or RedisSaver
-    checkpointer = MemorySaver()
+    # Use provided checkpointer or default to MemorySaver
+    if checkpointer is None:
+        checkpointer = MemorySaver()
 
     # Create agent using native LangChain API
     # Returns CompiledStateGraph - pass directly to create_a2a_executor()

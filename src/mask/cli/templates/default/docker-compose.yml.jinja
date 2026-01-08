@@ -11,7 +11,7 @@
 #   - openai-wrapper: OpenAI-compatible API for Open WebUI (port 11434)
 
 services:
-  # A2A Protocol Agent Server
+  # A2A Protocol Agent Server (with PostgreSQL persistence)
   agent:
     build:
       context: .
@@ -24,6 +24,8 @@ services:
     environment:
       - A2A_HOST=0.0.0.0
       - A2A_PORT=10001
+    # Uses main_persistent.py by default (from Dockerfile CMD)
+    # For InMemory mode: command: ["python", "-m", "{{ module_name }}.main"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:10001/.well-known/agent.json"]
       interval: 30s
