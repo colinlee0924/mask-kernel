@@ -186,15 +186,29 @@ def create_persistent_a2a_server(
     logger = logging.getLogger(__name__)
 
     # Create PostgresSaver for LangGraph checkpoints
+    # Note: from_conn_string() returns a context manager, so for long-running servers
+    # we use psycopg_pool.ConnectionPool directly
     try:
         from langgraph.checkpoint.postgres import PostgresSaver
+        from psycopg import connect
+        from psycopg_pool import ConnectionPool
 
-        checkpointer = PostgresSaver.from_conn_string(database_url)
+        # First, run setup with autocommit=True to allow CREATE INDEX CONCURRENTLY
+        # This needs to be outside a transaction block
+        with connect(database_url, autocommit=True) as setup_conn:
+            temp_saver = PostgresSaver(setup_conn)
+            temp_saver.setup()
+        logger.info("PostgresSaver tables initialized (schema created)")
+
+        # Create connection pool for long-running server
+        pool = ConnectionPool(conninfo=database_url)
+        checkpointer = PostgresSaver(pool)
         logger.info("Created PostgresSaver checkpointer for LangGraph")
-    except ImportError:
+    except ImportError as e:
         logger.warning(
-            "langgraph-checkpoint-postgres not installed. "
-            "Install with: pip install langgraph-checkpoint-postgres"
+            "langgraph-checkpoint-postgres or psycopg not installed. "
+            "Install with: pip install langgraph-checkpoint-postgres psycopg[pool]. Error: %s",
+            e,
         )
         checkpointer = None
     except Exception as e:
