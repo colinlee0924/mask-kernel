@@ -605,12 +605,28 @@ class MaskAgentExecutor(AgentExecutor):
                 active_tool_calls[run_id] = tool_name
 
                 # Create tool_call artifact with input
+                # Handle non-serializable objects gracefully
                 current_tool_artifact_id = str(uuid.uuid4())
-                tool_info = json.dumps(
-                    {"tool": tool_name, "input": tool_input, "status": "running"},
-                    ensure_ascii=False,
-                    indent=2,
-                )
+                try:
+                    # Try to serialize input, convert non-serializable to string
+                    serializable_input = tool_input
+                    if not isinstance(tool_input, (str, int, float, bool, type(None))):
+                        try:
+                            json.dumps(tool_input)
+                        except (TypeError, ValueError):
+                            serializable_input = str(tool_input)
+                    tool_info = json.dumps(
+                        {"tool": tool_name, "input": serializable_input, "status": "running"},
+                        ensure_ascii=False,
+                        indent=2,
+                        default=str,  # Fallback for any remaining non-serializable
+                    )
+                except Exception:
+                    tool_info = json.dumps(
+                        {"tool": tool_name, "input": str(tool_input), "status": "running"},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
                 artifact = _create_text_artifact(
                     current_tool_artifact_id, "tool_call", tool_info
                 )

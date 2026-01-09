@@ -67,23 +67,37 @@ def setup_postgres_tables(database_url: str) -> bool:
 
 async def create_async_checkpointer(
     database_url: str,
+    min_size: int = 2,
+    max_size: int = 20,
+    timeout: float = 60.0,
 ) -> Optional["AsyncPostgresSaver"]:
     """Create AsyncPostgresSaver for LangGraph checkpoints.
 
     MUST be called in async context (inside async function).
     Call setup_postgres_tables() first to initialize the schema.
 
+    IMPORTANT: This must be called within the same event loop where
+    the checkpointer will be used (e.g., inside uvicorn's lifespan).
+    Creating the pool in one event loop and using it in another will
+    cause PoolTimeout errors.
+
     Args:
         database_url: PostgreSQL connection URL.
             Example: "postgresql://user:pass@localhost:5432/my_db"
+        min_size: Minimum number of connections in the pool.
+        max_size: Maximum number of connections in the pool.
+        timeout: Connection timeout in seconds.
 
     Returns:
         AsyncPostgresSaver instance or None if creation fails.
 
     Example:
-        >>> async def setup():
+        >>> @asynccontextmanager
+        ... async def lifespan(app):
         ...     checkpointer = await create_async_checkpointer(database_url)
-        ...     return checkpointer
+        ...     yield
+        ...     if checkpointer:
+        ...         await checkpointer.conn.close()
     """
     try:
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -93,13 +107,18 @@ async def create_async_checkpointer(
         # Then explicitly open with wait=True to ensure connections are ready
         async_pool = AsyncConnectionPool(
             conninfo=database_url,
-            min_size=1,
-            max_size=10,
+            min_size=min_size,
+            max_size=max_size,
+            timeout=timeout,
             open=False,
         )
         await async_pool.open(wait=True)
         checkpointer = AsyncPostgresSaver(async_pool)
-        logger.info("Created AsyncPostgresSaver checkpointer")
+        logger.info(
+            "Created AsyncPostgresSaver checkpointer (pool: min=%d, max=%d)",
+            min_size,
+            max_size,
+        )
         return checkpointer
     except ImportError as e:
         logger.warning(
