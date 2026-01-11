@@ -13,15 +13,26 @@ Components:
 - RemoteAgentConnection: Connect to remote A2A agents
 - RemoteAgentRegistry: Manage multiple remote agent connections
 
+Multi-agent orchestration:
+- StreamingA2AClient: Subscribe to sub-agent event streams
+- DelegationToolFactory: Create delegation tools for orchestrator agents
+- create_delegation_tools: Convenience function to create delegation tools
+
 For LangGraph checkpoint helpers, use mask.checkpoints module:
     from mask.checkpoints import setup_postgres_tables, create_async_checkpointer
 """
 
+from mask.a2a.delegation import (
+    DelegationToolFactory,
+    create_delegation_tools,
+    create_delegation_tool_sync,
+)
 from mask.a2a.executor import MaskAgentExecutor
 from mask.a2a.helpers import create_a2a_executor, create_database_task_store
 from mask.a2a.openai_compat import create_openai_compat_app, run_openai_compat_server
 from mask.a2a.remote_connection import RemoteAgentConnection, RemoteAgentRegistry
 from mask.a2a.server import MaskA2AServer
+from mask.a2a.streaming_client import StreamingA2AClient, create_streaming_client
 
 __all__ = [
     # Recommended helpers
@@ -29,6 +40,12 @@ __all__ = [
     "create_database_task_store",
     "create_openai_compat_app",
     "run_openai_compat_server",
+    # Multi-agent orchestration
+    "StreamingA2AClient",
+    "create_streaming_client",
+    "DelegationToolFactory",
+    "create_delegation_tools",
+    "create_delegation_tool_sync",
     # Legacy (deprecated)
     "MaskA2AServer",
     "MaskAgentExecutor",

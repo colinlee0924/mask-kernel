@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from langgraph.graph.state import CompiledStateGraph
 
     from mask.agent.base_agent import BaseAgent
+    from mask.middleware.a2a_streaming import A2AStreamingMiddleware
     from mask.storage.base import SessionStore
 
 logger = logging.getLogger(__name__)
@@ -99,6 +100,7 @@ class MaskAgentExecutor(AgentExecutor):
         server_name: str = None,
         checkpointer: Optional["BaseCheckpointSaver"] = None,
         session_store: Optional["SessionStore"] = None,
+        streaming_middleware: Optional["A2AStreamingMiddleware"] = None,
     ) -> None:
         """Initialize executor with agent.
 
@@ -110,12 +112,16 @@ class MaskAgentExecutor(AgentExecutor):
             checkpointer: Optional LangGraph checkpointer for persistence.
                          If provided, enables session history persistence.
             session_store: Optional MASK SessionStore for session metadata.
+            streaming_middleware: Optional A2AStreamingMiddleware for event propagation.
+                         If provided, the middleware's event_queue is set dynamically
+                         before each execution to enable real-time event streaming.
         """
         self.agent = agent
         self.stream = stream
         self.server_name = server_name
         self.checkpointer = checkpointer
         self.session_store = session_store
+        self.streaming_middleware = streaming_middleware
         # Track last checkpoint_id for metadata injection
         self._last_checkpoint_id: Optional[str] = None
         # Detect agent type: CompiledStateGraph has ainvoke but not invoke with session
@@ -471,8 +477,16 @@ class MaskAgentExecutor(AgentExecutor):
         - response: Final text response
 
         Each event type uses a unique artifact_id for proper UI rendering.
+
+        If streaming_middleware is configured, its event_queue is set to enable
+        real-time event propagation from middleware hooks.
         """
         from langchain_core.messages import HumanMessage
+
+        # Set up streaming middleware with event_queue for this execution
+        if self.streaming_middleware:
+            self.streaming_middleware.event_queue = event_queue
+            self.streaming_middleware.reset()
 
         full_response = ""
         thread_id = context_id or str(uuid.uuid4())
