@@ -104,6 +104,36 @@ class StreamingA2AClient:
         """Get the agent's AgentCard metadata."""
         return self._card
 
+    async def _ensure_client(self) -> httpx.AsyncClient:
+        """Create a fresh httpx client for the current request.
+
+        This method always creates a new client to avoid event loop mismatch issues
+        that occur when the client was created in a different event loop
+        (e.g., during asyncio.run() startup) but is now being used
+        in a different event loop (e.g., during uvicorn request handling).
+
+        Returns:
+            A fresh httpx.AsyncClient instance.
+        """
+        try:
+            # Always create a fresh client for each request to avoid event loop issues
+            # The client will be closed after the streaming request completes
+            client = httpx.AsyncClient(timeout=self.timeout)
+            logger.debug("Created fresh HTTP client for %s", self.base_url)
+
+            # Re-resolve agent card if we don't have it
+            if self._card is None:
+                resolver = A2ACardResolver(client, self.base_url)
+                self._card = await resolver.get_agent_card()
+                if not self.agent_name:
+                    self.agent_name = self._card.name
+
+            return client
+
+        except Exception as e:
+            logger.error("Failed to create client: %s", e)
+            raise RuntimeError(f"Failed to connect to {self.base_url}: {e}") from e
+
     async def send_message_streaming(
         self,
         text: str,
@@ -127,8 +157,8 @@ class StreamingA2AClient:
             RuntimeError: If not connected.
             httpx.HTTPError: If request fails.
         """
-        if not self._http_client:
-            raise RuntimeError("Client not connected. Call connect() first.")
+        # Create a fresh client for this request to avoid event loop issues
+        client = await self._ensure_client()
 
         # Generate IDs
         message_id = str(uuid4())
@@ -169,7 +199,7 @@ class StreamingA2AClient:
         final_result = ""
 
         try:
-            async with self._http_client.stream(
+            async with client.stream(
                 "POST",
                 url,
                 json=request_body,
@@ -200,6 +230,9 @@ class StreamingA2AClient:
                 source_agent=self.agent_name or "unknown",
                 run_id=run_id,
             )
+        finally:
+            # Close the client after streaming completes
+            await client.aclose()
 
         # Emit delegation end event
         yield AgentEvent.delegation_end(
