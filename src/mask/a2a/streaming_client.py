@@ -165,11 +165,11 @@ class StreamingA2AClient:
         context_id = context_id or str(uuid4())
         run_id = str(uuid4())
 
-        # Build JSON-RPC request for sendSubscribe
+        # Build JSON-RPC request for message/stream
         request_body = {
             "jsonrpc": "2.0",
             "id": str(uuid4()),
-            "method": "tasks/sendSubscribe",
+            "method": "message/stream",
             "params": {
                 "message": {
                     "messageId": message_id,
@@ -254,48 +254,37 @@ class StreamingA2AClient:
         Yields:
             Parsed JSON data from each SSE event.
         """
-        buffer = ""
+        # Use aiter_lines() for better SSE handling
+        # SSE events are line-based: "data: {...}\n\n"
+        current_data = None
 
-        async for chunk in response.aiter_text():
-            buffer += chunk
+        async for line in response.aiter_lines():
+            line = line.strip()
 
-            # Process complete events (separated by double newlines)
-            while "\n\n" in buffer:
-                event_str, buffer = buffer.split("\n\n", 1)
-                event_data = self._parse_sse_event(event_str)
-                if event_data:
-                    yield event_data
+            # Skip empty lines (event separator)
+            if not line:
+                if current_data is not None:
+                    yield current_data
+                    current_data = None
+                continue
 
-        # Handle any remaining data
-        if buffer.strip():
-            event_data = self._parse_sse_event(buffer)
-            if event_data:
-                yield event_data
+            # Skip SSE comments (ping messages)
+            if line.startswith(":"):
+                continue
 
-    def _parse_sse_event(self, event_str: str) -> Optional[Dict[str, Any]]:
-        """Parse a single SSE event string.
-
-        Args:
-            event_str: Raw SSE event string.
-
-        Returns:
-            Parsed JSON data or None if parsing fails.
-        """
-        data_line = None
-
-        for line in event_str.strip().split("\n"):
+            # Parse data lines
             if line.startswith("data:"):
-                data_line = line[5:].strip()
-                break
+                data_str = line[5:].strip()
+                if data_str:
+                    try:
+                        current_data = json.loads(data_str)
+                    except json.JSONDecodeError as e:
+                        logger.debug("Failed to parse SSE data: %s", e)
+                        current_data = None
 
-        if not data_line:
-            return None
-
-        try:
-            return json.loads(data_line)
-        except json.JSONDecodeError as e:
-            logger.debug("Failed to parse SSE data: %s", e)
-            return None
+        # Yield any remaining data
+        if current_data is not None:
+            yield current_data
 
     def _convert_to_agent_event(
         self,
@@ -388,32 +377,49 @@ class StreamingA2AClient:
                     elif artifact_name == "tool_call":
                         try:
                             tool_data = json.loads(text)
+                            tool_name = tool_data.get("tool", "unknown")
+                            # Input may be a string (Python repr) or dict
+                            input_val = tool_data.get("input", {})
+                            input_data = input_val if isinstance(input_val, dict) else {}
                             return AgentEvent.sub_agent_tool_start(
-                                tool_name=tool_data.get("tool", "unknown"),
+                                tool_name=tool_name,
                                 source_agent=source_agent,
-                                input_data=tool_data.get("input", {}),
+                                input_data=input_data,
                                 run_id=run_id,
                             )
                         except json.JSONDecodeError:
-                            pass
+                            # Fallback: try to extract tool name from text
+                            logger.debug("Failed to parse tool_call JSON: %s", text[:100])
+                            return AgentEvent.sub_agent_tool_start(
+                                tool_name="unknown",
+                                source_agent=source_agent,
+                                input_data={},
+                                run_id=run_id,
+                            )
 
                     # Tool result artifact
                     elif artifact_name == "tool_result":
                         try:
                             result_data = json.loads(text)
+                            tool_name = result_data.get("tool", "unknown")
+                            output = result_data.get("output", text)
+                            # Truncate long outputs for display
+                            if isinstance(output, str) and len(output) > 200:
+                                output = output[:200] + "..."
                             return AgentEvent.sub_agent_tool_end(
-                                tool_name=result_data.get("tool", "unknown"),
+                                tool_name=tool_name,
                                 source_agent=source_agent,
-                                output=result_data.get("output", text),
+                                output=output,
                                 run_id=run_id,
                                 duration_ms=result_data.get("duration_ms", 0),
                             )
                         except json.JSONDecodeError:
                             # Plain text result
+                            logger.debug("Failed to parse tool_result JSON: %s", text[:100])
                             return AgentEvent.sub_agent_tool_end(
                                 tool_name="unknown",
                                 source_agent=source_agent,
-                                output=text,
+                                output=text[:200] if len(text) > 200 else text,
                                 run_id=run_id,
                             )
 
