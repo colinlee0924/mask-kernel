@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
     from langgraph.graph.state import CompiledStateGraph
 
+    from mask.a2a.delegation import DelegationToolFactory
     from mask.agent.base_agent import BaseAgent
     from mask.middleware.a2a_streaming import A2AStreamingMiddleware
     from mask.storage.base import SessionStore
@@ -101,6 +102,7 @@ class MaskAgentExecutor(AgentExecutor):
         checkpointer: Optional["BaseCheckpointSaver"] = None,
         session_store: Optional["SessionStore"] = None,
         streaming_middleware: Optional["A2AStreamingMiddleware"] = None,
+        delegation_factory: Optional["DelegationToolFactory"] = None,
     ) -> None:
         """Initialize executor with agent.
 
@@ -115,6 +117,9 @@ class MaskAgentExecutor(AgentExecutor):
             streaming_middleware: Optional A2AStreamingMiddleware for event propagation.
                          If provided, the middleware's event_queue is set dynamically
                          before each execution to enable real-time event streaming.
+            delegation_factory: Optional DelegationToolFactory for multi-agent delegation.
+                         If provided, the factory's event_queue is set dynamically
+                         before each execution to enable sub-agent event propagation.
         """
         self.agent = agent
         self.stream = stream
@@ -122,6 +127,7 @@ class MaskAgentExecutor(AgentExecutor):
         self.checkpointer = checkpointer
         self.session_store = session_store
         self.streaming_middleware = streaming_middleware
+        self.delegation_factory = delegation_factory
         # Track last checkpoint_id for metadata injection
         self._last_checkpoint_id: Optional[str] = None
         # Detect agent type: CompiledStateGraph has ainvoke but not invoke with session
@@ -483,10 +489,18 @@ class MaskAgentExecutor(AgentExecutor):
         """
         from langchain_core.messages import HumanMessage
 
-        # Set up streaming middleware with event_queue for this execution
+        # Set up streaming middleware with event_queue and context for this execution
         if self.streaming_middleware:
             self.streaming_middleware.event_queue = event_queue
+            self.streaming_middleware.context_id = context_id
+            self.streaming_middleware.task_id = task_id
             self.streaming_middleware.reset()
+
+        # Set up delegation factory with event_queue and context for sub-agent events
+        if self.delegation_factory:
+            self.delegation_factory.event_queue = event_queue
+            self.delegation_factory.context_id = context_id
+            self.delegation_factory.task_id = task_id
 
         full_response = ""
         thread_id = context_id or str(uuid.uuid4())

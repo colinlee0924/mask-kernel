@@ -62,6 +62,10 @@ class DelegationToolFactory:
         self._clients: Dict[str, StreamingA2AClient] = {}
         self._descriptions: Dict[str, str] = {}
 
+        # A2A context for streaming events (set by executor before each invocation)
+        self.context_id: Optional[str] = None
+        self.task_id: Optional[str] = None
+
     async def register_agent(
         self,
         url: str,
@@ -236,7 +240,7 @@ class DelegationToolFactory:
             # Import here to avoid circular imports
             from uuid import uuid4
 
-            from a2a.types import Message, Part, Role, TaskState, TaskStatusUpdateEvent
+            from a2a.types import Message, Part, Role, TaskState, TaskStatus, TaskStatusUpdateEvent
 
             # Map event types to display text
             event_display_map = {
@@ -253,24 +257,33 @@ class DelegationToolFactory:
                 # Skip events without display text (e.g., text_delta handled by artifacts)
                 return
 
+            # Use context_id and task_id if available, otherwise generate UUIDs
+            context_id = self.context_id or str(uuid4())
+            task_id = self.task_id or str(uuid4())
+
             # Emit status update event
-            self.event_queue.enqueue_event(
+            await self.event_queue.enqueue_event(
                 TaskStatusUpdateEvent(
-                    state=TaskState.working,
-                    message=Message(
-                        messageId=str(uuid4()),
-                        role=Role.agent,
-                        parts=[
-                            Part(text=display_text),
-                            Part(
-                                data={
-                                    "event_type": event.type,
-                                    "source_agent": source_agent,
-                                    "name": event.name,
-                                    **event.data,
-                                }
-                            ),
-                        ],
+                    contextId=context_id,
+                    taskId=task_id,
+                    final=False,
+                    status=TaskStatus(
+                        state=TaskState.working,
+                        message=Message(
+                            messageId=str(uuid4()),
+                            role=Role.agent,
+                            parts=[
+                                Part(text=display_text),
+                                Part(
+                                    data={
+                                        "event_type": event.type,
+                                        "source_agent": source_agent,
+                                        "name": event.name,
+                                        **event.data,
+                                    }
+                                ),
+                            ],
+                        ),
                     ),
                 )
             )

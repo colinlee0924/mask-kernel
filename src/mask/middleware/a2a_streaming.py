@@ -95,6 +95,10 @@ class A2AStreamingMiddleware(AgentMiddleware if HAS_AGENT_MIDDLEWARE else object
         self._call_count = 0
         self._tool_start_times: Dict[str, float] = {}
 
+        # A2A context for streaming events (set by executor before each invocation)
+        self.context_id: Optional[str] = None
+        self.task_id: Optional[str] = None
+
     def reset(self) -> None:
         """Reset per-invocation state."""
         self._call_count = 0
@@ -398,15 +402,20 @@ class A2AStreamingMiddleware(AgentMiddleware if HAS_AGENT_MIDDLEWARE else object
         event_type: str,
         extra_data: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Emit a status update event."""
+        """Emit a status update event.
+
+        Note: This method schedules the event emission asynchronously since
+        middleware hooks are synchronous but EventQueue.enqueue_event is async.
+        """
         if not self.event_queue:
             logger.debug("[%s] %s: %s", self.agent_name, event_type, content)
             return
 
         try:
+            import asyncio
             from uuid import uuid4
 
-            from a2a.types import Message, Part, Role, TaskState, TaskStatusUpdateEvent
+            from a2a.types import Message, Part, Role, TaskState, TaskStatus, TaskStatusUpdateEvent
 
             data = {
                 "event_type": event_type,
@@ -415,8 +424,15 @@ class A2AStreamingMiddleware(AgentMiddleware if HAS_AGENT_MIDDLEWARE else object
             if extra_data:
                 data.update(extra_data)
 
-            self.event_queue.enqueue_event(
-                TaskStatusUpdateEvent(
+            # Use context_id and task_id if available, otherwise generate UUIDs
+            context_id = self.context_id or str(uuid4())
+            task_id = self.task_id or str(uuid4())
+
+            event = TaskStatusUpdateEvent(
+                contextId=context_id,
+                taskId=task_id,
+                final=False,
+                status=TaskStatus(
                     state=TaskState.working,
                     message=Message(
                         messageId=str(uuid4()),
@@ -426,8 +442,16 @@ class A2AStreamingMiddleware(AgentMiddleware if HAS_AGENT_MIDDLEWARE else object
                             Part(data=data),
                         ],
                     ),
-                )
+                ),
             )
+
+            # Schedule async enqueue if we're in an event loop
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.event_queue.enqueue_event(event))
+            except RuntimeError:
+                # No running loop - this shouldn't happen in normal A2A execution
+                logger.debug("No event loop available for event emission")
 
         except Exception as e:
             logger.warning("Failed to emit status event: %s", e)
@@ -440,7 +464,11 @@ class A2AStreamingMiddleware(AgentMiddleware if HAS_AGENT_MIDDLEWARE else object
         tool_output: str = "",
         duration_ms: int = 0,
     ) -> None:
-        """Emit tool-related event."""
+        """Emit tool-related event.
+
+        Note: This method schedules the event emission asynchronously since
+        middleware hooks are synchronous but EventQueue.enqueue_event is async.
+        """
         if not self.event_queue:
             if event_type == "tool_start":
                 logger.debug("[%s] 🔧 %s starting", self.agent_name, tool_name)
@@ -449,9 +477,10 @@ class A2AStreamingMiddleware(AgentMiddleware if HAS_AGENT_MIDDLEWARE else object
             return
 
         try:
+            import asyncio
             from uuid import uuid4
 
-            from a2a.types import Message, Part, Role, TaskState, TaskStatusUpdateEvent
+            from a2a.types import Message, Part, Role, TaskState, TaskStatus, TaskStatusUpdateEvent
 
             if event_type == "tool_start":
                 content = f"🔧 Calling: {tool_name}"
@@ -471,8 +500,15 @@ class A2AStreamingMiddleware(AgentMiddleware if HAS_AGENT_MIDDLEWARE else object
                     "duration_ms": duration_ms,
                 }
 
-            self.event_queue.enqueue_event(
-                TaskStatusUpdateEvent(
+            # Use context_id and task_id if available, otherwise generate UUIDs
+            context_id = self.context_id or str(uuid4())
+            task_id = self.task_id or str(uuid4())
+
+            event = TaskStatusUpdateEvent(
+                contextId=context_id,
+                taskId=task_id,
+                final=False,
+                status=TaskStatus(
                     state=TaskState.working,
                     message=Message(
                         messageId=str(uuid4()),
@@ -482,8 +518,16 @@ class A2AStreamingMiddleware(AgentMiddleware if HAS_AGENT_MIDDLEWARE else object
                             Part(data=data),
                         ],
                     ),
-                )
+                ),
             )
+
+            # Schedule async enqueue if we're in an event loop
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.event_queue.enqueue_event(event))
+            except RuntimeError:
+                # No running loop - this shouldn't happen in normal A2A execution
+                logger.debug("No event loop available for event emission")
 
         except Exception as e:
             logger.warning("Failed to emit tool event: %s", e)
