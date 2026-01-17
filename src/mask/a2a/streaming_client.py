@@ -380,16 +380,40 @@ class StreamingA2AClient:
                             tool_name = tool_data.get("tool", "unknown")
                             # Input may be a string (Python repr) or dict
                             input_val = tool_data.get("input", {})
-                            input_data = input_val if isinstance(input_val, dict) else {}
+
+                            # Handle different input formats
+                            if isinstance(input_val, dict):
+                                input_data = input_val
+                            elif isinstance(input_val, str):
+                                # Try to parse string as JSON
+                                try:
+                                    parsed = json.loads(input_val)
+                                    input_data = parsed if isinstance(parsed, dict) else {"value": input_val}
+                                except json.JSONDecodeError:
+                                    # Extract key-value pairs from Python repr string
+                                    # e.g., "{'jql': 'text ~ \"AI\"', ...}"
+                                    input_data = {"raw": input_val[:200]}
+                            else:
+                                input_data = {}
+
+                            logger.info(
+                                "[TOOL-DEBUG] Parsed tool_call: tool=%s, input_keys=%s",
+                                tool_name,
+                                list(input_data.keys()) if isinstance(input_data, dict) else "N/A",
+                            )
                             return AgentEvent.sub_agent_tool_start(
                                 tool_name=tool_name,
                                 source_agent=source_agent,
                                 input_data=input_data,
                                 run_id=run_id,
                             )
-                        except json.JSONDecodeError:
+                        except json.JSONDecodeError as e:
                             # Fallback: try to extract tool name from text
-                            logger.debug("Failed to parse tool_call JSON: %s", text[:100])
+                            logger.warning(
+                                "[TOOL-DEBUG] Failed to parse tool_call JSON: %s, text=%s",
+                                e,
+                                text[:200],
+                            )
                             return AgentEvent.sub_agent_tool_start(
                                 tool_name="unknown",
                                 source_agent=source_agent,

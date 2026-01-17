@@ -257,6 +257,16 @@ class DelegationToolFactory:
                 # Skip events without display text (e.g., text_delta handled by artifacts)
                 return
 
+            # Debug log for sub-agent tool events
+            if event.type in ("sub_agent_tool_start", "sub_agent_tool_end"):
+                logger.info(
+                    "[EMIT-DEBUG] %s: name=%s, source=%s, data_keys=%s",
+                    event.type,
+                    event.name,
+                    source_agent,
+                    list(event.data.keys()) if event.data else "empty",
+                )
+
             # Use context_id and task_id if available, otherwise generate UUIDs
             context_id = self.context_id or str(uuid4())
             task_id = self.task_id or str(uuid4())

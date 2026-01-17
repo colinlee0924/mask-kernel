@@ -633,25 +633,56 @@ class MaskAgentExecutor(AgentExecutor):
                 active_tool_calls[run_id] = tool_name
 
                 # Create tool_call artifact with input
-                # Handle non-serializable objects gracefully
+                # Extract only JSON-serializable parts of tool_input
                 current_tool_artifact_id = str(uuid.uuid4())
-                try:
-                    # Try to serialize input, convert non-serializable to string
-                    serializable_input = tool_input
-                    if not isinstance(tool_input, (str, int, float, bool, type(None))):
+
+                def extract_serializable_input(obj):
+                    """Extract only JSON-serializable data from tool input."""
+                    if obj is None or isinstance(obj, (str, int, float, bool)):
+                        return obj
+                    elif isinstance(obj, dict):
+                        result = {}
+                        for k, v in obj.items():
+                            # Skip runtime/internal keys
+                            if k in ("runtime", "config", "callbacks", "state"):
+                                continue
+                            try:
+                                serialized = extract_serializable_input(v)
+                                if serialized is not None:
+                                    result[k] = serialized
+                            except (TypeError, ValueError):
+                                pass
+                        return result if result else None
+                    elif isinstance(obj, (list, tuple)):
+                        result = []
+                        for item in obj:
+                            try:
+                                serialized = extract_serializable_input(item)
+                                if serialized is not None:
+                                    result.append(serialized)
+                            except (TypeError, ValueError):
+                                pass
+                        return result if result else None
+                    else:
+                        # Try to get a simple string representation
                         try:
-                            json.dumps(tool_input)
+                            json.dumps(obj)
+                            return obj
                         except (TypeError, ValueError):
-                            serializable_input = str(tool_input)
+                            return None
+
+                try:
+                    serializable_input = extract_serializable_input(tool_input)
+                    if serializable_input is None:
+                        serializable_input = {}
                     tool_info = json.dumps(
                         {"tool": tool_name, "input": serializable_input, "status": "running"},
                         ensure_ascii=False,
                         indent=2,
-                        default=str,  # Fallback for any remaining non-serializable
                     )
                 except Exception:
                     tool_info = json.dumps(
-                        {"tool": tool_name, "input": str(tool_input), "status": "running"},
+                        {"tool": tool_name, "input": {}, "status": "running"},
                         ensure_ascii=False,
                         indent=2,
                     )
