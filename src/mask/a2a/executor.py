@@ -864,17 +864,23 @@ class MaskAgentExecutor(AgentExecutor):
         Returns:
             HandoffContext if found, None otherwise.
         """
-        message = context.message
-        if not message:
-            return None
-
-        # Check message metadata for handoff context
-        # A2A supports metadata field on messages
+        # Check context.metadata first (A2A SDK property from MessageSendParams)
+        # This is where metadata is passed in message/send params
         metadata: Optional[Dict[str, Any]] = None
-        if hasattr(message, "metadata") and message.metadata:
-            metadata = message.metadata
-        elif hasattr(message, "root") and hasattr(message.root, "metadata"):
-            metadata = message.root.metadata
+
+        # Primary: context.metadata (from MessageSendParams.metadata)
+        if hasattr(context, "metadata") and context.metadata:
+            metadata = context.metadata
+            logger.debug("Found metadata on context: %s", list(metadata.keys()))
+
+        # Fallback: check message.metadata
+        if not metadata:
+            message = context.message
+            if message:
+                if hasattr(message, "metadata") and message.metadata:
+                    metadata = message.metadata
+                elif hasattr(message, "root") and hasattr(message.root, "metadata"):
+                    metadata = message.root.metadata
 
         if not metadata:
             return None
@@ -883,6 +889,8 @@ class MaskAgentExecutor(AgentExecutor):
         handoff_data = metadata.get("handoff_context") or metadata.get("handoff")
         if not handoff_data:
             return None
+
+        logger.debug("Found handoff_context in metadata: %s", handoff_data)
 
         # Parse handoff context
         if isinstance(handoff_data, dict):

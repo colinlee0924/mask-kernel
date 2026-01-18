@@ -112,20 +112,27 @@ class NativeRemoteAgentConnection:
 
         Convenience method that creates a Message from text.
 
+        Note: task_id is intentionally NOT passed to the sub-agent.
+        Each delegation creates a new task on the sub-agent. The
+        orchestrator's task_id is for tracking on the orchestrator side.
+
         Args:
             text: Message text to send.
             context_id: Optional context ID for conversation continuity.
-            task_id: Optional task ID for task continuation.
+            task_id: Optional task ID (currently ignored - sub-agent creates own task).
 
         Returns:
             Task or Message response from remote agent.
         """
+        # Note: We don't pass task_id to sub-agent - it creates its own task.
+        # Passing the orchestrator's task_id would fail because the sub-agent
+        # doesn't know about that task.
         message = Message(
             role=Role.user,
             parts=[Part(root=TextPart(text=text))],
             message_id=str(uuid4()),
             context_id=context_id or str(uuid4()),
-            task_id=task_id,
+            # task_id intentionally omitted - let sub-agent create new task
         )
 
         return await self.send_message(message)
@@ -193,23 +200,77 @@ class NativeRemoteAgentFactory:
             httpx_client: Optional httpx client (creates one if not provided).
             timeout: HTTP timeout in seconds.
         """
-        self._owns_client = httpx_client is None
-        self._httpx_client = httpx_client or httpx.AsyncClient(timeout=timeout)
+        self._external_client = httpx_client
         self._timeout = timeout
 
-        # Create ClientFactory with supported transports
-        config = ClientConfig(
-            httpx_client=self._httpx_client,
-            supported_transports=[
-                TransportProtocol.jsonrpc,
-                TransportProtocol.http_json,
-            ],
-        )
-        self._client_factory = ClientFactory(config)
+        # Lazy initialization - will be created on first use in current event loop
+        self._httpx_client: Optional[httpx.AsyncClient] = None
+        self._client_factory: Optional[ClientFactory] = None
+        self._created_in_loop: Optional[Any] = None  # Track which event loop client was created in
 
-        # Store connections and cards
+        # Store connections and cards (these don't depend on event loop)
         self._connections: Dict[str, NativeRemoteAgentConnection] = {}
         self._cards: Dict[str, AgentCard] = {}
+        self._agent_urls: Dict[str, str] = {}  # Store URLs for re-registration
+
+    def _ensure_client_factory(self) -> ClientFactory:
+        """Ensure client factory exists in current event loop.
+
+        Creates a fresh httpx client and client factory if needed.
+        This handles the case where the factory was created in a different
+        event loop (e.g., asyncio.run() vs uvicorn).
+        """
+        import asyncio
+
+        # Get current event loop
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        # Check if we need to recreate the client
+        need_recreate = False
+        if self._httpx_client is None:
+            need_recreate = True
+        elif self._httpx_client.is_closed:
+            need_recreate = True
+        else:
+            # Check if the client was created in a different event loop
+            # by checking if any stored loop reference differs
+            if hasattr(self, "_created_in_loop") and self._created_in_loop != current_loop:
+                logger.info(
+                    "Event loop changed (old: %s, new: %s), recreating client",
+                    id(self._created_in_loop) if self._created_in_loop else "None",
+                    id(current_loop) if current_loop else "None",
+                )
+                need_recreate = True
+
+        if need_recreate:
+            # Create fresh client in current event loop
+            if self._external_client:
+                self._httpx_client = self._external_client
+            else:
+                self._httpx_client = httpx.AsyncClient(timeout=self._timeout)
+
+            # Store the loop we created the client in
+            self._created_in_loop = current_loop
+
+            # Create fresh client factory
+            config = ClientConfig(
+                httpx_client=self._httpx_client,
+                supported_transports=[
+                    TransportProtocol.jsonrpc,
+                    TransportProtocol.http_json,
+                ],
+            )
+            self._client_factory = ClientFactory(config)
+
+            # Re-register connections with new factory
+            self._connections.clear()
+            logger.info("Created fresh httpx client and ClientFactory in loop %s",
+                       id(current_loop) if current_loop else "None")
+
+        return self._client_factory
 
     @property
     def connections(self) -> Dict[str, NativeRemoteAgentConnection]:
@@ -238,17 +299,21 @@ class NativeRemoteAgentFactory:
         Raises:
             httpx.HTTPError: If connection to agent fails.
         """
+        # Ensure client factory exists in current event loop
+        client_factory = self._ensure_client_factory()
+
         # Resolve agent card
         card_resolver = A2ACardResolver(self._httpx_client, url)
         card = await card_resolver.get_agent_card()
 
         # Create connection
-        connection = NativeRemoteAgentConnection(self._client_factory, card)
+        connection = NativeRemoteAgentConnection(client_factory, card)
 
         # Register with name override if provided
         agent_name = name or card.name
         self._connections[agent_name] = connection
         self._cards[agent_name] = card
+        self._agent_urls[agent_name] = url  # Store for re-registration
 
         logger.info(
             "Registered remote agent: %s at %s (description: %s)",
@@ -313,8 +378,17 @@ class NativeRemoteAgentFactory:
         Returns:
             Text response from the agent.
         """
+        # Ensure client factory exists (may need recreation after event loop change)
+        self._ensure_client_factory()
+
+        # Check if connection exists, re-register if needed
         if agent_name not in self._connections:
-            return f"Error: Agent '{agent_name}' not found"
+            # Try to re-register from stored URL
+            if agent_name in self._agent_urls:
+                logger.info("Re-registering agent %s after event loop change", agent_name)
+                await self.register_agent(self._agent_urls[agent_name], name=agent_name)
+            else:
+                return f"Error: Agent '{agent_name}' not found"
 
         connection = self._connections[agent_name]
 
