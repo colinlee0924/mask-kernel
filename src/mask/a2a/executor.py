@@ -41,7 +41,9 @@ if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
     from langgraph.graph.state import CompiledStateGraph
 
+    from mask.a2a.delegation import DelegationToolFactory
     from mask.agent.base_agent import BaseAgent
+    from mask.middleware.a2a_streaming import A2AStreamingMiddleware
     from mask.storage.base import SessionStore
 
 logger = logging.getLogger(__name__)
@@ -99,6 +101,8 @@ class MaskAgentExecutor(AgentExecutor):
         server_name: str = None,
         checkpointer: Optional["BaseCheckpointSaver"] = None,
         session_store: Optional["SessionStore"] = None,
+        streaming_middleware: Optional["A2AStreamingMiddleware"] = None,
+        delegation_factory: Optional["DelegationToolFactory"] = None,
     ) -> None:
         """Initialize executor with agent.
 
@@ -110,12 +114,20 @@ class MaskAgentExecutor(AgentExecutor):
             checkpointer: Optional LangGraph checkpointer for persistence.
                          If provided, enables session history persistence.
             session_store: Optional MASK SessionStore for session metadata.
+            streaming_middleware: Optional A2AStreamingMiddleware for event propagation.
+                         If provided, the middleware's event_queue is set dynamically
+                         before each execution to enable real-time event streaming.
+            delegation_factory: Optional DelegationToolFactory for multi-agent delegation.
+                         If provided, the factory's event_queue is set dynamically
+                         before each execution to enable sub-agent event propagation.
         """
         self.agent = agent
         self.stream = stream
         self.server_name = server_name
         self.checkpointer = checkpointer
         self.session_store = session_store
+        self.streaming_middleware = streaming_middleware
+        self.delegation_factory = delegation_factory
         # Track last checkpoint_id for metadata injection
         self._last_checkpoint_id: Optional[str] = None
         # Detect agent type: CompiledStateGraph has ainvoke but not invoke with session
@@ -471,8 +483,24 @@ class MaskAgentExecutor(AgentExecutor):
         - response: Final text response
 
         Each event type uses a unique artifact_id for proper UI rendering.
+
+        If streaming_middleware is configured, its event_queue is set to enable
+        real-time event propagation from middleware hooks.
         """
         from langchain_core.messages import HumanMessage
+
+        # Set up streaming middleware with event_queue and context for this execution
+        if self.streaming_middleware:
+            self.streaming_middleware.event_queue = event_queue
+            self.streaming_middleware.context_id = context_id
+            self.streaming_middleware.task_id = task_id
+            self.streaming_middleware.reset()
+
+        # Set up delegation factory with event_queue and context for sub-agent events
+        if self.delegation_factory:
+            self.delegation_factory.event_queue = event_queue
+            self.delegation_factory.context_id = context_id
+            self.delegation_factory.task_id = task_id
 
         full_response = ""
         thread_id = context_id or str(uuid.uuid4())
@@ -605,25 +633,56 @@ class MaskAgentExecutor(AgentExecutor):
                 active_tool_calls[run_id] = tool_name
 
                 # Create tool_call artifact with input
-                # Handle non-serializable objects gracefully
+                # Extract only JSON-serializable parts of tool_input
                 current_tool_artifact_id = str(uuid.uuid4())
-                try:
-                    # Try to serialize input, convert non-serializable to string
-                    serializable_input = tool_input
-                    if not isinstance(tool_input, (str, int, float, bool, type(None))):
+
+                def extract_serializable_input(obj):
+                    """Extract only JSON-serializable data from tool input."""
+                    if obj is None or isinstance(obj, (str, int, float, bool)):
+                        return obj
+                    elif isinstance(obj, dict):
+                        result = {}
+                        for k, v in obj.items():
+                            # Skip runtime/internal keys
+                            if k in ("runtime", "config", "callbacks", "state"):
+                                continue
+                            try:
+                                serialized = extract_serializable_input(v)
+                                if serialized is not None:
+                                    result[k] = serialized
+                            except (TypeError, ValueError):
+                                pass
+                        return result if result else None
+                    elif isinstance(obj, (list, tuple)):
+                        result = []
+                        for item in obj:
+                            try:
+                                serialized = extract_serializable_input(item)
+                                if serialized is not None:
+                                    result.append(serialized)
+                            except (TypeError, ValueError):
+                                pass
+                        return result if result else None
+                    else:
+                        # Try to get a simple string representation
                         try:
-                            json.dumps(tool_input)
+                            json.dumps(obj)
+                            return obj
                         except (TypeError, ValueError):
-                            serializable_input = str(tool_input)
+                            return None
+
+                try:
+                    serializable_input = extract_serializable_input(tool_input)
+                    if serializable_input is None:
+                        serializable_input = {}
                     tool_info = json.dumps(
                         {"tool": tool_name, "input": serializable_input, "status": "running"},
                         ensure_ascii=False,
                         indent=2,
-                        default=str,  # Fallback for any remaining non-serializable
                     )
                 except Exception:
                     tool_info = json.dumps(
-                        {"tool": tool_name, "input": str(tool_input), "status": "running"},
+                        {"tool": tool_name, "input": {}, "status": "running"},
                         ensure_ascii=False,
                         indent=2,
                     )
@@ -805,17 +864,23 @@ class MaskAgentExecutor(AgentExecutor):
         Returns:
             HandoffContext if found, None otherwise.
         """
-        message = context.message
-        if not message:
-            return None
-
-        # Check message metadata for handoff context
-        # A2A supports metadata field on messages
+        # Check context.metadata first (A2A SDK property from MessageSendParams)
+        # This is where metadata is passed in message/send params
         metadata: Optional[Dict[str, Any]] = None
-        if hasattr(message, "metadata") and message.metadata:
-            metadata = message.metadata
-        elif hasattr(message, "root") and hasattr(message.root, "metadata"):
-            metadata = message.root.metadata
+
+        # Primary: context.metadata (from MessageSendParams.metadata)
+        if hasattr(context, "metadata") and context.metadata:
+            metadata = context.metadata
+            logger.debug("Found metadata on context: %s", list(metadata.keys()))
+
+        # Fallback: check message.metadata
+        if not metadata:
+            message = context.message
+            if message:
+                if hasattr(message, "metadata") and message.metadata:
+                    metadata = message.metadata
+                elif hasattr(message, "root") and hasattr(message.root, "metadata"):
+                    metadata = message.root.metadata
 
         if not metadata:
             return None
@@ -824,6 +889,8 @@ class MaskAgentExecutor(AgentExecutor):
         handoff_data = metadata.get("handoff_context") or metadata.get("handoff")
         if not handoff_data:
             return None
+
+        logger.debug("Found handoff_context in metadata: %s", handoff_data)
 
         # Parse handoff context
         if isinstance(handoff_data, dict):

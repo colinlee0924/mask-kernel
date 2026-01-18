@@ -45,8 +45,10 @@ if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
     from langgraph.graph.state import CompiledStateGraph
 
+    from mask.a2a.delegation import DelegationToolFactory
     from mask.a2a.executor import MaskAgentExecutor
     from mask.agent.base_agent import BaseAgent
+    from mask.middleware.a2a_streaming import A2AStreamingMiddleware
     from mask.storage.base import SessionStore
 
 logger = logging.getLogger(__name__)
@@ -58,6 +60,8 @@ def create_a2a_executor(
     server_name: Optional[str] = None,
     checkpointer: Optional["BaseCheckpointSaver"] = None,
     session_store: Optional["SessionStore"] = None,
+    streaming_middleware: Optional["A2AStreamingMiddleware"] = None,
+    delegation_factory: Optional["DelegationToolFactory"] = None,
 ) -> "MaskAgentExecutor":
     """Create an A2A executor from a LangChain CompiledStateGraph or MASK agent.
 
@@ -72,6 +76,7 @@ def create_a2a_executor(
     - OpenTelemetry tracing integration
     - PostgreSQL persistence via LangGraph checkpointer (optional)
     - Session history synchronization with frontend (optional)
+    - A2AStreamingMiddleware integration for real-time event propagation
 
     Args:
         agent: LangChain CompiledStateGraph or MASK BaseAgent instance.
@@ -81,6 +86,12 @@ def create_a2a_executor(
         checkpointer: Optional LangGraph checkpointer for persistence.
             Use PostgresSaver.from_conn_string(DATABASE_URL) for PostgreSQL.
         session_store: Optional MASK SessionStore for session metadata.
+        streaming_middleware: Optional A2AStreamingMiddleware for event propagation.
+            If provided, the middleware's event_queue is set dynamically before
+            each execution to enable real-time event streaming from middleware hooks.
+        delegation_factory: Optional DelegationToolFactory for multi-agent delegation.
+            If provided, the factory's event_queue is set dynamically before each
+            execution to enable sub-agent event propagation.
 
     Returns:
         MaskAgentExecutor instance compatible with A2A SDK.
@@ -92,15 +103,17 @@ def create_a2a_executor(
         from a2a.server.tasks import InMemoryTaskStore
         from a2a.types import AgentCapabilities, AgentCard, AgentSkill
         from mask.a2a import create_a2a_executor
+        from mask.middleware import A2AStreamingMiddleware
 
         # Create agent using native LangChain API
-        graph = create_agent(model, tools, system_prompt)
+        middleware = A2AStreamingMiddleware(agent_name="my-agent")
+        graph = create_agent(model, tools, system_prompt, middleware=[middleware])
 
-        # Create executor (with optional persistence)
+        # Create executor with streaming middleware
         executor = create_a2a_executor(
             graph,
             server_name="my-agent",
-            # checkpointer=PostgresSaver.from_conn_string(DATABASE_URL),
+            streaming_middleware=middleware,  # Enable real-time events
         )
 
         # Build A2A server with native SDK
@@ -124,6 +137,8 @@ def create_a2a_executor(
         server_name=server_name,
         checkpointer=checkpointer,
         session_store=session_store,
+        streaming_middleware=streaming_middleware,
+        delegation_factory=delegation_factory,
     )
 
 
