@@ -75,7 +75,8 @@ class NativeRemoteAgentConnection:
         """Send message to remote agent using native SDK.
 
         This method iterates through all events from the SDK's send_message
-        generator and returns the final Task or Message.
+        generator and returns the final Task or Message. If the stream ends
+        with an error after receiving events, we return the last valid Task.
 
         Args:
             message: A2A Message to send.
@@ -93,10 +94,16 @@ class NativeRemoteAgentConnection:
                 if isinstance(event, tuple) and len(event) > 0:
                     task = event[0]
                     if isinstance(task, Task):
+                        # Keep updating last_task - artifacts accumulate over events
+                        last_task = task
                         if self._is_terminal_state(task):
                             return task
-                        last_task = task
         except Exception as e:
+            # A2A SDK may throw "streamed Message after first response" error
+            # but we may already have complete data in last_task
+            if last_task:
+                logger.debug("Stream error after receiving task data, using last_task: %s", e)
+                return last_task
             logger.error("Error sending message to %s: %s", self.name, e)
             raise
 
@@ -144,14 +151,15 @@ class NativeRemoteAgentConnection:
             task: The task to check.
 
         Returns:
-            True if task is complete, canceled, failed, input_required, or unknown.
+            True if task is complete, canceled, failed, or input_required.
+            Note: unknown is NOT terminal - it's an initial/intermediate state.
         """
         terminal_states = {
             TaskState.completed,
             TaskState.canceled,
             TaskState.failed,
             TaskState.input_required,
-            TaskState.unknown,
+            # Note: TaskState.unknown is NOT terminal - it's initial state
         }
         return task.status.state in terminal_states
 
@@ -426,15 +434,23 @@ class NativeRemoteAgentFactory:
         if isinstance(response, Task):
             texts = []
 
-            # Extract from status message
-            if response.status and response.status.message:
-                texts.append(self._extract_parts_text(response.status.message.parts))
-
-            # Extract from artifacts
+            # Extract from artifacts (final response content)
+            # Skip tool_call/tool_result artifacts - only get "response" artifacts
             if response.artifacts:
                 for artifact in response.artifacts:
+                    # Skip tool-related artifacts (tool_call, tool_result)
+                    artifact_name = getattr(artifact, "name", "") or ""
+                    if artifact_name in ("tool_call", "tool_result"):
+                        continue
                     if artifact.parts:
-                        texts.append(self._extract_parts_text(artifact.parts))
+                        artifact_text = self._extract_parts_text(artifact.parts)
+                        texts.append(artifact_text)
+
+            # Fallback to status message only if no response artifacts
+            if not texts and response.status and response.status.message:
+                status_text = self._extract_parts_text(response.status.message.parts)
+                if status_text:
+                    texts.append(status_text)
 
             return "\n".join(filter(None, texts)) or "Task completed"
 
@@ -442,6 +458,11 @@ class NativeRemoteAgentFactory:
 
     def _extract_parts_text(self, parts: Optional[List[Part]]) -> str:
         """Extract text from message parts.
+
+        Handles multiple Part formats:
+        - Part(root=TextPart(text="..."))
+        - Part with direct text attribute
+        - Dict-like parts from JSON
 
         Args:
             parts: List of message parts.
@@ -454,14 +475,29 @@ class NativeRemoteAgentFactory:
 
         texts = []
         for part in parts:
-            if hasattr(part, "root"):
+            text = None
+
+            # Try Part.root.text (standard A2A SDK format)
+            if hasattr(part, "root") and part.root is not None:
                 root = part.root
                 if hasattr(root, "text"):
-                    texts.append(root.text)
-                elif hasattr(root, "kind") and root.kind == "text":
-                    texts.append(getattr(root, "text", ""))
-            elif hasattr(part, "text"):
-                texts.append(part.text)
+                    text = root.text
+                elif isinstance(root, dict) and "text" in root:
+                    text = root["text"]
+
+            # Try direct text attribute
+            if text is None and hasattr(part, "text"):
+                text = part.text
+
+            # Try dict-like access (for deserialized JSON)
+            if text is None and isinstance(part, dict):
+                if "text" in part:
+                    text = part["text"]
+                elif "root" in part and isinstance(part["root"], dict):
+                    text = part["root"].get("text")
+
+            if text:
+                texts.append(str(text))
 
         return "".join(texts)
 
