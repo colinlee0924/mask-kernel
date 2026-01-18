@@ -166,6 +166,17 @@ class A2AStreamingMiddleware(AgentMiddleware if HAS_AGENT_MIDDLEWARE else object
     # Model Call Hooks
     # =========================================================================
 
+    # Thinking phase messages inspired by Claude Code
+    # Round 1: Analyzing the request
+    # Round 2+: Synthesizing tool results into final response
+    _PHASE_MESSAGES = {
+        1: "Analyzing",      # 分析中 - understanding the request
+        2: "Synthesizing",   # 合成中 - combining tool results
+        3: "Refining",       # 精煉中 - polishing the response
+        4: "Deliberating",   # 深思中 - complex multi-step reasoning
+        5: "Cogitating",     # 思索中 - deep thinking
+    }
+
     def before_model(
         self,
         state: Dict[str, Any],
@@ -190,10 +201,8 @@ class A2AStreamingMiddleware(AgentMiddleware if HAS_AGENT_MIDDLEWARE else object
             )
 
         if self.emit_thinking:
-            if self._call_count == 1:
-                phase = "Analyzing request"
-            else:
-                phase = f"Thinking (round {self._call_count})"
+            # Use descriptive phase messages instead of "Thinking (round N)"
+            phase = self._PHASE_MESSAGES.get(self._call_count, "Processing")
             self._emit_status(f"🤔 {phase}...", "llm_thinking")
 
         return None
@@ -404,6 +413,9 @@ class A2AStreamingMiddleware(AgentMiddleware if HAS_AGENT_MIDDLEWARE else object
     ) -> None:
         """Emit a status update event.
 
+        Uses TextPart.metadata instead of separate DataPart for cleaner A2A compliance.
+        Consumers can read just the text, or inspect metadata for event details.
+
         Note: This method schedules the event emission asynchronously since
         middleware hooks are synchronous but EventQueue.enqueue_event is async.
         """
@@ -415,14 +427,22 @@ class A2AStreamingMiddleware(AgentMiddleware if HAS_AGENT_MIDDLEWARE else object
             import asyncio
             from uuid import uuid4
 
-            from a2a.types import Message, Part, Role, TaskState, TaskStatus, TaskStatusUpdateEvent
+            from a2a.types import (
+                Message,
+                Role,
+                TaskState,
+                TaskStatus,
+                TaskStatusUpdateEvent,
+                TextPart,
+            )
 
-            data = {
+            # Build metadata (replaces separate DataPart)
+            metadata = {
                 "event_type": event_type,
                 "agent_name": self.agent_name,
             }
             if extra_data:
-                data.update(extra_data)
+                metadata.update(extra_data)
 
             # Use context_id and task_id if available, otherwise generate UUIDs
             context_id = self.context_id or str(uuid4())
@@ -438,8 +458,7 @@ class A2AStreamingMiddleware(AgentMiddleware if HAS_AGENT_MIDDLEWARE else object
                         messageId=str(uuid4()),
                         role=Role.agent,
                         parts=[
-                            Part(text=content),
-                            Part(data=data),
+                            TextPart(text=content, metadata=metadata),
                         ],
                     ),
                 ),
@@ -466,6 +485,8 @@ class A2AStreamingMiddleware(AgentMiddleware if HAS_AGENT_MIDDLEWARE else object
     ) -> None:
         """Emit tool-related event.
 
+        Uses TextPart.metadata instead of separate DataPart for cleaner A2A compliance.
+
         Note: This method schedules the event emission asynchronously since
         middleware hooks are synchronous but EventQueue.enqueue_event is async.
         """
@@ -480,11 +501,18 @@ class A2AStreamingMiddleware(AgentMiddleware if HAS_AGENT_MIDDLEWARE else object
             import asyncio
             from uuid import uuid4
 
-            from a2a.types import Message, Part, Role, TaskState, TaskStatus, TaskStatusUpdateEvent
+            from a2a.types import (
+                Message,
+                Role,
+                TaskState,
+                TaskStatus,
+                TaskStatusUpdateEvent,
+                TextPart,
+            )
 
             if event_type == "tool_start":
                 content = f"🔧 Calling: {tool_name}"
-                data = {
+                metadata = {
                     "event_type": "tool_start",
                     "agent_name": self.agent_name,
                     "tool_name": tool_name,
@@ -492,7 +520,7 @@ class A2AStreamingMiddleware(AgentMiddleware if HAS_AGENT_MIDDLEWARE else object
                 }
             else:  # tool_end
                 content = f"✅ {tool_name} done ({duration_ms}ms)"
-                data = {
+                metadata = {
                     "event_type": "tool_end",
                     "agent_name": self.agent_name,
                     "tool_name": tool_name,
@@ -514,8 +542,7 @@ class A2AStreamingMiddleware(AgentMiddleware if HAS_AGENT_MIDDLEWARE else object
                         messageId=str(uuid4()),
                         role=Role.agent,
                         parts=[
-                            Part(text=content),
-                            Part(data=data),
+                            TextPart(text=content, metadata=metadata),
                         ],
                     ),
                 ),

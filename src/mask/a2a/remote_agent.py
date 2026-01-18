@@ -12,7 +12,7 @@ avoiding the event loop issues we encountered with our custom implementation.
 """
 
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Union
 from uuid import uuid4
 
 import httpx
@@ -23,7 +23,9 @@ from a2a.types import (
     Part,
     Role,
     Task,
+    TaskArtifactUpdateEvent,
     TaskState,
+    TaskStatusUpdateEvent,
     TextPart,
     TransportProtocol,
 )
@@ -143,6 +145,116 @@ class NativeRemoteAgentConnection:
         )
 
         return await self.send_message(message)
+
+    async def send_message_streaming(
+        self,
+        message: Message,
+        on_event: Optional[Callable[[Any], None]] = None,
+    ) -> AsyncGenerator[Tuple[str, Any], None]:
+        """Send message and yield streaming events from remote agent.
+
+        Unlike send_message() which only returns the final result, this method
+        yields all intermediate events (status updates, artifact updates) for
+        propagation to parent event queues.
+
+        Args:
+            message: A2A Message to send.
+            on_event: Optional callback for each event (for logging/debugging).
+
+        Yields:
+            Tuple of (event_type, event_data) for each streaming event:
+            - ("status_update", TaskStatusUpdateEvent)
+            - ("artifact_update", TaskArtifactUpdateEvent)
+            - ("task", Task) - intermediate task state
+            - ("message", Message) - direct message response
+            - ("final", Task | Message | None) - final result
+        """
+        last_task: Optional[Task] = None
+
+        try:
+            async for event in self.agent_client.send_message(message):
+                if on_event:
+                    on_event(event)
+
+                # Handle direct Message response
+                if isinstance(event, Message):
+                    yield ("message", event)
+                    yield ("final", event)
+                    return
+
+                # Handle tuple events from A2A SDK
+                # Format: (Task, Event) or just (Task,)
+                if isinstance(event, tuple):
+                    if len(event) >= 1:
+                        task = event[0]
+                        if isinstance(task, Task):
+                            last_task = task
+                            yield ("task", task)
+
+                            # Check for terminal state
+                            if self._is_terminal_state(task):
+                                yield ("final", task)
+                                return
+
+                    # Check for streaming events in tuple[1]
+                    if len(event) >= 2:
+                        streaming_event = event[1]
+
+                        # Handle TaskStatusUpdateEvent (thinking, tool calls, etc.)
+                        if isinstance(streaming_event, TaskStatusUpdateEvent):
+                            yield ("status_update", streaming_event)
+
+                        # Handle TaskArtifactUpdateEvent (content streaming)
+                        elif isinstance(streaming_event, TaskArtifactUpdateEvent):
+                            yield ("artifact_update", streaming_event)
+
+                        # Handle dict-like events (some SDK versions)
+                        elif isinstance(streaming_event, dict):
+                            kind = streaming_event.get("kind")
+                            if kind == "status-update":
+                                yield ("status_update", streaming_event)
+                            elif kind == "artifact-update":
+                                yield ("artifact_update", streaming_event)
+
+        except Exception as e:
+            # A2A SDK may throw errors but we may have valid data
+            if last_task:
+                logger.debug("Stream error after receiving task data, using last_task: %s", e)
+                yield ("final", last_task)
+                return
+            logger.error("Error in streaming from %s: %s", self.name, e)
+            raise
+
+        # Yield final result if we haven't already
+        yield ("final", last_task)
+
+    async def send_text_streaming(
+        self,
+        text: str,
+        context_id: Optional[str] = None,
+        on_event: Optional[Callable[[Any], None]] = None,
+    ) -> AsyncGenerator[Tuple[str, Any], None]:
+        """Send text and yield streaming events.
+
+        Convenience method combining send_text with streaming.
+
+        Args:
+            text: Message text to send.
+            context_id: Optional context ID.
+            on_event: Optional callback for each event.
+
+        Yields:
+            Streaming events from the remote agent.
+        """
+        message = Message(
+            role=Role.user,
+            parts=[Part(root=TextPart(text=text))],
+            message_id=str(uuid4()),
+            context_id=context_id or str(uuid4()),
+        )
+
+        async for event in self.send_message_streaming(message, on_event):
+            yield event
 
     def _is_terminal_state(self, task: Task) -> bool:
         """Check if task is in terminal state.
@@ -412,6 +524,57 @@ class NativeRemoteAgentFactory:
         except Exception as e:
             logger.error("Error sending to %s: %s", agent_name, e)
             return f"Error delegating to {agent_name}: {str(e)}"
+
+    async def send_message_streaming(
+        self,
+        agent_name: str,
+        text: str,
+        context_id: Optional[str] = None,
+        on_event: Optional[Callable[[Any], None]] = None,
+    ) -> AsyncGenerator[Tuple[str, Any], None]:
+        """Send message with streaming events from sub-agent.
+
+        This method propagates all streaming events (status updates, tool calls,
+        artifacts) from the sub-agent, allowing the orchestrator to re-emit them.
+
+        Args:
+            agent_name: Name of the target agent.
+            text: Message text to send.
+            context_id: Optional context ID.
+            on_event: Optional callback for each raw event.
+
+        Yields:
+            Tuple of (event_type, event_data):
+            - ("status_update", TaskStatusUpdateEvent | dict)
+            - ("artifact_update", TaskArtifactUpdateEvent | dict)
+            - ("task", Task)
+            - ("final", Task | Message | None)
+        """
+        # Ensure client factory exists
+        self._ensure_client_factory()
+
+        # Check if connection exists, re-register if needed
+        if agent_name not in self._connections:
+            if agent_name in self._agent_urls:
+                logger.info("Re-registering agent %s after event loop change", agent_name)
+                await self.register_agent(self._agent_urls[agent_name], name=agent_name)
+            else:
+                yield ("error", f"Agent '{agent_name}' not found")
+                return
+
+        connection = self._connections[agent_name]
+
+        try:
+            async for event_type, event_data in connection.send_text_streaming(
+                text=text,
+                context_id=context_id,
+                on_event=on_event,
+            ):
+                yield (event_type, event_data)
+
+        except Exception as e:
+            logger.error("Error streaming from %s: %s", agent_name, e)
+            yield ("error", str(e))
 
     def _extract_response_text(
         self,
