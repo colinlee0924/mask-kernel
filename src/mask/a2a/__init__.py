@@ -10,13 +10,17 @@ Components:
 - run_openai_compat_server: Run OpenAI-compatible wrapper server
 - MaskA2AServer: Expose MASK agent as A2A remote service (deprecated)
 - MaskAgentExecutor: Bridge BaseAgent to A2A AgentExecutor
-- RemoteAgentConnection: Connect to remote A2A agents
-- RemoteAgentRegistry: Manage multiple remote agent connections
 
-Multi-agent orchestration:
-- StreamingA2AClient: Subscribe to sub-agent event streams
+Multi-agent orchestration (Native SDK - Recommended):
+- NativeRemoteAgentConnection: Connect to remote A2A agents using native SDK
+- NativeRemoteAgentFactory: Factory for managing remote agent connections
 - DelegationToolFactory: Create delegation tools for orchestrator agents
 - create_delegation_tools: Convenience function to create delegation tools
+
+Legacy (Deprecated - may have issues in uvicorn):
+- RemoteAgentConnection: Connect to remote A2A agents (legacy)
+- RemoteAgentRegistry: Manage multiple remote agent connections (legacy)
+- StreamingA2AClient: Subscribe to sub-agent event streams (deprecated)
 
 For LangGraph checkpoint helpers, use mask.checkpoints module:
     from mask.checkpoints import setup_postgres_tables, create_async_checkpointer
@@ -30,6 +34,7 @@ from mask.a2a.delegation import (
 from mask.a2a.executor import MaskAgentExecutor
 from mask.a2a.helpers import create_a2a_executor, create_database_task_store
 from mask.a2a.openai_compat import create_openai_compat_app, run_openai_compat_server
+from mask.a2a.remote_agent import NativeRemoteAgentConnection, NativeRemoteAgentFactory
 from mask.a2a.remote_connection import RemoteAgentConnection, RemoteAgentRegistry
 from mask.a2a.server import MaskA2AServer
 from mask.a2a.streaming_client import StreamingA2AClient, create_streaming_client
@@ -40,9 +45,9 @@ __all__ = [
     "create_database_task_store",
     "create_openai_compat_app",
     "run_openai_compat_server",
-    # Multi-agent orchestration
-    "StreamingA2AClient",
-    "create_streaming_client",
+    # Multi-agent orchestration (Native SDK - Recommended)
+    "NativeRemoteAgentConnection",
+    "NativeRemoteAgentFactory",
     "DelegationToolFactory",
     "create_delegation_tools",
     "create_delegation_tool_sync",
@@ -51,4 +56,6 @@ __all__ = [
     "MaskAgentExecutor",
     "RemoteAgentConnection",
     "RemoteAgentRegistry",
+    "StreamingA2AClient",
+    "create_streaming_client",
 ]

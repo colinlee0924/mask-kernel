@@ -1,16 +1,19 @@
 """Delegation tool factory for multi-agent orchestration.
 
 This module provides tools for delegating tasks from an orchestrator agent
-to sub-agents via A2A protocol, with real-time event streaming.
+to sub-agents via A2A protocol, using the native A2A SDK.
 
 The delegation tools return LangGraph Command objects to:
 1. Inject ToolMessage with sub-agent results
 2. Update agent state (e.g., delegation_history)
 
 Following the MASK skill loader pattern with Command support.
+
+IMPORTANT: This module uses the native A2A SDK's ClientFactory and Client
+classes for reliable communication, avoiding the event loop issues we
+encountered with custom SSE parsing in StreamingA2AClient.
 """
 
-import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -18,7 +21,7 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, tool
 from langgraph.types import Command
 
-from mask.a2a.streaming_client import StreamingA2AClient
+from mask.a2a.remote_agent import NativeRemoteAgentFactory
 from mask.core.events import AgentEvent
 
 if TYPE_CHECKING:
@@ -28,18 +31,21 @@ logger = logging.getLogger(__name__)
 
 
 class DelegationToolFactory:
-    """Factory for creating delegation tools for orchestrator agents.
+    """Factory for creating delegation tools using native A2A SDK.
 
-    Creates tools that delegate tasks to sub-agents and stream events
-    back to the frontend via A2A EventQueue.
+    Creates tools that delegate tasks to sub-agents. Uses the official
+    A2A SDK's ClientFactory and Client for reliable communication.
 
     Example:
         factory = DelegationToolFactory()
         await factory.register_agent("http://localhost:10001", "jira-agent")
         await factory.register_agent("http://localhost:10002", "faq-agent")
 
+        # Get tools for LLM routing
         tools = factory.get_tools()
-        # Returns: [delegate_to_jira_agent, delegate_to_faq_agent]
+
+        # Or send directly (for parameter routing)
+        result = await factory.send_message_direct("jira-agent", "Hello")
 
     Attributes:
         event_queue: A2A EventQueue for streaming events (set dynamically).
@@ -59,12 +65,24 @@ class DelegationToolFactory:
         """
         self.event_queue = event_queue
         self.track_delegation_history = track_delegation_history
-        self._clients: Dict[str, StreamingA2AClient] = {}
+
+        # Use native A2A SDK factory
+        self._native_factory = NativeRemoteAgentFactory()
         self._descriptions: Dict[str, str] = {}
 
         # A2A context for streaming events (set by executor before each invocation)
         self.context_id: Optional[str] = None
         self.task_id: Optional[str] = None
+
+    @property
+    def connections(self) -> Dict[str, Any]:
+        """Get all registered connections."""
+        return self._native_factory.connections
+
+    @property
+    def cards(self) -> Dict[str, Any]:
+        """Get all registered agent cards."""
+        return self._native_factory.cards
 
     async def register_agent(
         self,
@@ -85,19 +103,17 @@ class DelegationToolFactory:
         Raises:
             httpx.HTTPError: If connection to agent fails.
         """
-        client = StreamingA2AClient(url, agent_name=name)
-        await client.connect()
-
-        agent_name = client.agent_name or name or url
-        self._clients[agent_name] = client
+        agent_name = await self._native_factory.register_agent(url, name=name)
 
         # Use provided description or extract from agent card
         if description:
             self._descriptions[agent_name] = description
-        elif client.card and client.card.description:
-            self._descriptions[agent_name] = client.card.description
         else:
-            self._descriptions[agent_name] = f"Delegate tasks to {agent_name}"
+            card = self._native_factory.cards.get(agent_name)
+            if card and card.description:
+                self._descriptions[agent_name] = card.description
+            else:
+                self._descriptions[agent_name] = f"Delegate tasks to {agent_name}"
 
         logger.info("Registered sub-agent: %s at %s", agent_name, url)
         return agent_name
@@ -109,8 +125,8 @@ class DelegationToolFactory:
             List of delegation tools.
         """
         return [
-            self._create_delegation_tool(name, client)
-            for name, client in self._clients.items()
+            self._create_delegation_tool(name)
+            for name in self._native_factory.get_agent_names()
         ]
 
     def get_agent_names(self) -> List[str]:
@@ -119,18 +135,44 @@ class DelegationToolFactory:
         Returns:
             List of agent names.
         """
-        return list(self._clients.keys())
+        return self._native_factory.get_agent_names()
+
+    async def send_message_direct(
+        self,
+        agent_name: str,
+        message: str,
+        context_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+    ) -> str:
+        """Send message directly to an agent (for parameter routing).
+
+        This method bypasses LLM routing and sends directly to the specified
+        agent. Used by OrchestratorExecutor for parameter-based routing.
+
+        Args:
+            agent_name: Name of the target agent.
+            message: Message text to send.
+            context_id: Optional context ID.
+            task_id: Optional task ID.
+
+        Returns:
+            Text response from the agent.
+        """
+        return await self._native_factory.send_message_direct(
+            agent_name=agent_name,
+            text=message,
+            context_id=context_id,
+            task_id=task_id,
+        )
 
     def _create_delegation_tool(
         self,
         agent_name: str,
-        client: StreamingA2AClient,
     ) -> BaseTool:
         """Create a delegation tool for a specific agent.
 
         Args:
             agent_name: Name of the sub-agent.
-            client: StreamingA2AClient for the agent.
 
         Returns:
             A BaseTool that delegates to the sub-agent.
@@ -154,35 +196,16 @@ class DelegationToolFactory:
             """
             tool_call_id = getattr(runtime, "tool_call_id", "unknown")
 
-            final_result = ""
-            delegation_events: List[Dict[str, Any]] = []
-            event_count = 0
-
             logger.debug("Delegating to %s: %s", agent_name, task[:100])
 
             try:
-                # Stream events from sub-agent
-                async for event in client.send_message_streaming(task):
-                    event_count += 1
-
-                    # Emit to frontend via EventQueue if available
-                    if factory.event_queue:
-                        await factory._emit_event_to_queue(event, agent_name)
-
-                    # Collect events for history
-                    delegation_events.append({
-                        "type": event.type,
-                        "name": event.name,
-                        "source_agent": event.source_agent,
-                    })
-
-                    # Accumulate final result from text deltas
-                    if event.type == "sub_agent_text_delta":
-                        delta = event.data.get("delta", "")
-                        final_result += delta
-                    elif event.type == "delegation_end":
-                        if not final_result:
-                            final_result = event.data.get("result", "Task completed")
+                # Use native SDK to send message
+                final_result = await factory._native_factory.send_message_direct(
+                    agent_name=agent_name,
+                    text=task,
+                    context_id=factory.context_id,
+                    task_id=factory.task_id,
+                )
 
             except Exception as e:
                 logger.error("Delegation to %s failed: %s", agent_name, e)
@@ -205,14 +228,12 @@ class DelegationToolFactory:
                         "agent": agent_name,
                         "task": task[:200],
                         "result": final_result[:500],
-                        "event_count": event_count,
                     }
                 ]
 
             logger.debug(
-                "Delegation to %s completed: %d events, result: %s...",
+                "Delegation to %s completed: result: %s...",
                 agent_name,
-                event_count,
                 final_result[:100],
             )
 
@@ -257,16 +278,6 @@ class DelegationToolFactory:
                 # Skip events without display text (e.g., text_delta handled by artifacts)
                 return
 
-            # Debug log for sub-agent tool events
-            if event.type in ("sub_agent_tool_start", "sub_agent_tool_end"):
-                logger.info(
-                    "[EMIT-DEBUG] %s: name=%s, source=%s, data_keys=%s",
-                    event.type,
-                    event.name,
-                    source_agent,
-                    list(event.data.keys()) if event.data else "empty",
-                )
-
             # Use context_id and task_id if available, otherwise generate UUIDs
             context_id = self.context_id or str(uuid4())
             task_id = self.task_id or str(uuid4())
@@ -303,9 +314,7 @@ class DelegationToolFactory:
 
     async def close(self) -> None:
         """Close all client connections."""
-        for client in self._clients.values():
-            await client.close()
-        self._clients.clear()
+        await self._native_factory.close()
         self._descriptions.clear()
 
 
@@ -344,28 +353,40 @@ async def create_delegation_tools(
     return factory.get_tools()
 
 
+# Legacy function for backwards compatibility
 def create_delegation_tool_sync(
     agent_name: str,
-    client: StreamingA2AClient,
+    client: Any,  # StreamingA2AClient - deprecated
     event_queue: Optional["EventQueue"] = None,
     track_history: bool = True,
 ) -> BaseTool:
     """Create a single delegation tool (synchronous factory method).
 
-    For cases where you already have a connected StreamingA2AClient.
+    DEPRECATED: This function uses the old StreamingA2AClient.
+    Use DelegationToolFactory.register_agent() instead.
 
     Args:
         agent_name: Name of the sub-agent.
-        client: Connected StreamingA2AClient.
+        client: Connected StreamingA2AClient (deprecated).
         event_queue: Optional A2A EventQueue.
         track_history: Whether to track delegation history.
 
     Returns:
         Delegation tool for the agent.
     """
+    import warnings
+    warnings.warn(
+        "create_delegation_tool_sync is deprecated. "
+        "Use DelegationToolFactory.register_agent() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
     factory = DelegationToolFactory(
         event_queue=event_queue,
         track_delegation_history=track_history,
     )
-    factory._clients[agent_name] = client
-    return factory._create_delegation_tool(agent_name, client)
+    # This is a compatibility shim - the tool won't work with old clients
+    # but allows existing code to not break immediately
+    factory._descriptions[agent_name] = f"Delegate tasks to {agent_name}"
+    return factory._create_delegation_tool(agent_name)
