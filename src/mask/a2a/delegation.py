@@ -15,7 +15,8 @@ encountered with custom SSE parsing in StreamingA2AClient.
 """
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Tuple
+from uuid import uuid4
 
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, tool
@@ -164,6 +165,231 @@ class DelegationToolFactory:
             context_id=context_id,
             task_id=task_id,
         )
+
+    async def send_message_streaming(
+        self,
+        agent_name: str,
+        message: str,
+        context_id: Optional[str] = None,
+    ) -> AsyncGenerator[Tuple[str, Any], None]:
+        """Send message with streaming events propagation.
+
+        This method yields all streaming events from the sub-agent, allowing
+        the orchestrator to re-emit them to the parent event queue.
+
+        Events are also automatically emitted to self.event_queue if set.
+
+        Args:
+            agent_name: Name of the target agent.
+            message: Message text to send.
+            context_id: Optional context ID.
+
+        Yields:
+            Tuple of (event_type, event_data):
+            - ("status_update", event) - status/thinking/tool events
+            - ("artifact_update", event) - content streaming
+            - ("task", Task) - intermediate task state
+            - ("final", result) - final result
+            - ("final_text", str) - extracted text from final result
+        """
+        final_result = None
+
+        async for event_type, event_data in self._native_factory.send_message_streaming(
+            agent_name=agent_name,
+            text=message,
+            context_id=context_id,
+        ):
+            # Emit events to A2A event queue if available
+            if self.event_queue and event_type in ("status_update", "artifact_update"):
+                await self._propagate_event_to_queue(
+                    event_type=event_type,
+                    event_data=event_data,
+                    source_agent=agent_name,
+                )
+
+            # Yield for caller to handle
+            yield (event_type, event_data)
+
+            # Track final result
+            if event_type == "final":
+                final_result = event_data
+
+        # Yield extracted text from final result
+        if final_result:
+            final_text = self._native_factory._extract_response_text(final_result)
+            yield ("final_text", final_text)
+
+    async def _propagate_event_to_queue(
+        self,
+        event_type: str,
+        event_data: Any,
+        source_agent: str,
+    ) -> None:
+        """Propagate a streaming event to the A2A event queue.
+
+        Converts sub-agent events to orchestrator events with proper metadata.
+
+        Args:
+            event_type: Type of event ("status_update" or "artifact_update").
+            event_data: The event data (TaskStatusUpdateEvent, dict, etc.).
+            source_agent: Name of the source sub-agent.
+        """
+        if not self.event_queue:
+            return
+
+        try:
+            from a2a.types import (
+                Message,
+                Part,
+                Role,
+                TaskState,
+                TaskStatus,
+                TaskStatusUpdateEvent,
+                TextPart,
+            )
+
+            # Use stored context IDs
+            ctx_id = self.context_id or str(uuid4())
+            t_id = self.task_id or str(uuid4())
+
+            if event_type == "status_update":
+                # Extract status info from event
+                status_text = self._extract_status_text(event_data, source_agent)
+                event_metadata = self._extract_event_metadata(event_data, source_agent)
+
+                if status_text:
+                    # Create TextPart with metadata for filtering
+                    text_part = TextPart(
+                        text=status_text,
+                        metadata=event_metadata,
+                    )
+
+                    await self.event_queue.enqueue_event(
+                        TaskStatusUpdateEvent(
+                            contextId=ctx_id,
+                            taskId=t_id,
+                            final=False,
+                            status=TaskStatus(
+                                state=TaskState.working,
+                                message=Message(
+                                    messageId=str(uuid4()),
+                                    role=Role.agent,
+                                    parts=[Part(root=text_part)],
+                                ),
+                            ),
+                        )
+                    )
+
+        except Exception as e:
+            logger.warning("Failed to propagate event to queue: %s", e)
+
+    def _extract_status_text(self, event_data: Any, source_agent: str) -> Optional[str]:
+        """Extract display text from status event.
+
+        Note: We do NOT add [agent] prefix here because:
+        1. The metadata already contains source_agent for tracking
+        2. The pipe function's _render_trajectory() handles formatting
+        3. Adding prefix here would cause duplication
+
+        Args:
+            event_data: Status event data.
+            source_agent: Name of the source agent (used only for logging).
+
+        Returns:
+            Human-readable status text or None.
+        """
+        # Handle TaskStatusUpdateEvent
+        if hasattr(event_data, "status") and event_data.status:
+            status = event_data.status
+            if hasattr(status, "message") and status.message:
+                parts = status.message.parts or []
+                for part in parts:
+                    # Try to get text from Part
+                    if hasattr(part, "root") and part.root:
+                        root = part.root
+                        if hasattr(root, "text") and root.text:
+                            return root.text  # Return raw text without prefix
+                    elif hasattr(part, "text") and part.text:
+                        return part.text  # Return raw text without prefix
+
+        # Handle dict-like event
+        if isinstance(event_data, dict):
+            status = event_data.get("status", {})
+            message = status.get("message", {})
+            parts = message.get("parts", [])
+            for part in parts:
+                text = None
+                if isinstance(part, dict):
+                    text = part.get("text")
+                    if not text and "root" in part:
+                        text = part["root"].get("text")
+                if text:
+                    return text  # Return raw text without prefix
+
+        return None
+
+    def _extract_event_metadata(self, event_data: Any, source_agent: str) -> Dict[str, Any]:
+        """Extract metadata from status event for filtering.
+
+        Preserves key fields from original event for proper formatting:
+        - event_type: For categorizing the event
+        - tool_name: For tool_start/tool_end events
+        - input: For tool_start events (tool arguments)
+        - output: For tool_end events (tool result preview)
+        - duration_ms: For tool_end events
+        - agent_name: For agent_start events
+
+        Args:
+            event_data: Status event data.
+            source_agent: Name of the source agent.
+
+        Returns:
+            Metadata dict with event_type, agent info, etc.
+        """
+        metadata: Dict[str, Any] = {
+            "source_agent": source_agent,
+            "is_propagated": True,  # Mark as propagated from sub-agent
+        }
+
+        # Try to extract original event_type from sub-agent's metadata
+        if hasattr(event_data, "status") and event_data.status:
+            status = event_data.status
+            if hasattr(status, "message") and status.message:
+                parts = status.message.parts or []
+                for part in parts:
+                    if hasattr(part, "root") and part.root:
+                        root = part.root
+                        if hasattr(root, "metadata") and root.metadata:
+                            orig_meta = root.metadata
+                            if isinstance(orig_meta, dict):
+                                metadata["event_type"] = orig_meta.get("event_type", "sub_agent_status")
+                                metadata["tool_name"] = orig_meta.get("tool_name")
+                                metadata["duration_ms"] = orig_meta.get("duration_ms")
+                                metadata["input"] = orig_meta.get("input")  # Tool input args
+                                metadata["output"] = orig_meta.get("output")  # Tool output
+                                metadata["agent_name"] = orig_meta.get("agent_name")
+
+        # Handle dict-like event
+        if isinstance(event_data, dict):
+            status = event_data.get("status", {})
+            message = status.get("message", {})
+            parts = message.get("parts", [])
+            for part in parts:
+                if isinstance(part, dict):
+                    orig_meta = part.get("metadata") or part.get("root", {}).get("metadata")
+                    if orig_meta:
+                        metadata["event_type"] = orig_meta.get("event_type", "sub_agent_status")
+                        metadata["tool_name"] = orig_meta.get("tool_name")
+                        metadata["duration_ms"] = orig_meta.get("duration_ms")
+                        metadata["input"] = orig_meta.get("input")  # Tool input args
+                        metadata["output"] = orig_meta.get("output")  # Tool output
+                        metadata["agent_name"] = orig_meta.get("agent_name")
+
+        # Default event_type if not found
+        if "event_type" not in metadata:
+            metadata["event_type"] = "sub_agent_status"
+
+        return metadata
 
     def _create_delegation_tool(
         self,
