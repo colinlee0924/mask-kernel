@@ -11,6 +11,10 @@ Components:
 - MaskA2AServer: Expose MASK agent as A2A remote service (deprecated)
 - MaskAgentExecutor: Bridge BaseAgent to A2A AgentExecutor
 
+Message Synchronization (Open WebUI integration):
+- StateSynchronizer: Sync Open WebUI messages with LangGraph checkpoints
+- SyncResult: Result of synchronization analysis (retry/delete detection)
+
 Multi-agent orchestration (Native SDK - Recommended):
 - NativeRemoteAgentConnection: Connect to remote A2A agents using native SDK
 - NativeRemoteAgentFactory: Factory for managing remote agent connections
@@ -28,8 +32,8 @@ For LangGraph checkpoint helpers, use mask.checkpoints module:
 
 from mask.a2a.delegation import (
     DelegationToolFactory,
-    create_delegation_tools,
     create_delegation_tool_sync,
+    create_delegation_tools,
 )
 from mask.a2a.executor import MaskAgentExecutor
 from mask.a2a.helpers import create_a2a_executor, create_database_task_store
@@ -37,6 +41,7 @@ from mask.a2a.openai_compat import create_openai_compat_app, run_openai_compat_s
 from mask.a2a.remote_agent import NativeRemoteAgentConnection, NativeRemoteAgentFactory
 from mask.a2a.remote_connection import RemoteAgentConnection, RemoteAgentRegistry
 from mask.a2a.server import MaskA2AServer
+from mask.a2a.state_sync import StateSynchronizer, SyncResult
 from mask.a2a.streaming_client import StreamingA2AClient, create_streaming_client
 
 __all__ = [
@@ -45,6 +50,9 @@ __all__ = [
     "create_database_task_store",
     "create_openai_compat_app",
     "run_openai_compat_server",
+    # Message synchronization (Open WebUI integration)
+    "StateSynchronizer",
+    "SyncResult",
     # Multi-agent orchestration (Native SDK - Recommended)
     "NativeRemoteAgentConnection",
     "NativeRemoteAgentFactory",
