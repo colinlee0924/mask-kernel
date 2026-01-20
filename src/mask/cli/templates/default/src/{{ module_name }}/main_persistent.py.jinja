@@ -3,10 +3,13 @@
 This server uses:
 - DatabaseTaskStore for A2A task persistence
 - AsyncPostgresSaver for LangGraph checkpoint persistence
+- Automatic environment-based checkpointer selection
+- Message synchronization for Open WebUI retry/delete operations
 
 Usage:
     # First, set DATABASE_URL in .env or environment:
-    DATABASE_URL=postgresql://user:pass@localhost:5432/{{ module_name }}
+    DATABASE_URL=postgresql://user:password@localhost:5432/{{ module_name }}
+    ENV=production
 
     # Then run:
     python -m {{ module_name }}.main_persistent
@@ -22,8 +25,8 @@ from a2a.server.apps import A2AStarletteApplication
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.types import AgentCapabilities, AgentCard, AgentSkill
 
-# LangGraph checkpoint helpers - from checkpoints module
-from mask.checkpoints import create_async_checkpointer, setup_postgres_tables
+# LangGraph checkpoint helpers - environment-based selection
+from mask.checkpoints import get_async_checkpointer, setup_postgres_tables
 # A2A helpers - from a2a module
 from mask.a2a import create_a2a_executor, create_database_task_store
 from mask.observability import setup_openinference_tracing
@@ -35,15 +38,20 @@ env_path = Path(__file__).parent.parent.parent / ".env"
 load_dotenv(env_path)
 
 
-async def setup_agent_with_persistence(database_url: str):
-    """Async setup for agent with PostgreSQL checkpointer."""
-    checkpointer = await create_async_checkpointer(database_url)
+async def setup_agent_with_persistence():
+    """Async setup for agent with environment-based checkpointer.
+
+    Uses get_async_checkpointer() which automatically selects:
+    - SQLite when ENV=local (default)
+    - PostgreSQL when ENV=production
+    """
+    checkpointer = await get_async_checkpointer()
     agent = await create_agent(checkpointer=checkpointer)
     return agent, checkpointer
 
 
 def main():
-    """Start the A2A server with PostgreSQL persistence."""
+    """Start the A2A server with persistence."""
     # Setup Phoenix tracing
     setup_openinference_tracing(
         project_name=os.environ.get("PHOENIX_PROJECT_NAME", "{{ project_name }}"),
@@ -54,42 +62,52 @@ def main():
     # Configure server
     host = os.environ.get("A2A_HOST", "0.0.0.0")
     port = int(os.environ.get("A2A_PORT", "10001"))
+    env = os.environ.get("ENV", "local")
 
-    # Database URL - each project should have its own database
+    # Database URL for task store (only used when ENV=production)
     database_url = os.environ.get("DATABASE_URL")
-    if not database_url:
-        print("ERROR: DATABASE_URL environment variable is required.")
+
+    if env == "production" and not database_url:
+        print("ERROR: DATABASE_URL environment variable is required for production.")
         print("Set it in .env or environment:")
         print("  DATABASE_URL=postgresql://user:password@localhost:5432/{{ module_name }}")
         return
 
-    print(f"Starting {{ project_name }} with PostgreSQL persistence...")
-    print(f"Database: {database_url.split('@')[1] if '@' in database_url else database_url}")
+    if database_url:
+        print(f"Starting {{ project_name }} with PostgreSQL persistence...")
+        print(f"Database: {database_url.split('@')[1] if '@' in database_url else database_url}")
+        # Initialize PostgreSQL tables (sync, before async operations)
+        setup_postgres_tables(database_url)
 
-    # Initialize PostgreSQL tables (sync, before async operations)
-    if not setup_postgres_tables(database_url):
-        print("WARNING: Failed to initialize PostgreSQL tables. Persistence may not work.")
+    # Create agent with async checkpointer (auto-selects based on ENV)
+    agent, checkpointer = asyncio.run(setup_agent_with_persistence())
 
-    # Create agent with async checkpointer
-    agent, checkpointer = asyncio.run(setup_agent_with_persistence(database_url))
+    # Create task store (database for production, in-memory fallback)
+    if database_url:
+        task_store = create_database_task_store(database_url)
+    else:
+        from a2a.server.tasks import InMemoryTaskStore
+        task_store = InMemoryTaskStore()
 
-    # Create DatabaseTaskStore for A2A tasks
-    task_store = create_database_task_store(database_url)
-
-    # Create executor
-    executor = create_a2a_executor(agent, server_name="{{ project_name }}", stream=True)
+    # Create executor with checkpointer for message sync support
+    executor = create_a2a_executor(
+        agent,
+        server_name="{{ project_name }}",
+        stream=True,
+        checkpointer=checkpointer,
+    )
 
     # Build A2A server using native SDK
     agent_card = AgentCard(
         name="{{ project_name }}",
-        description="A MASK-powered agent with PostgreSQL persistence",
+        description="A MASK-powered agent with persistence and message sync",
         url=f"http://{host}:{port}/",
         version="1.0.0",
         skills=[
             AgentSkill(
                 id="general",
                 name="General Assistant",
-                description="General purpose assistance with PostgreSQL persistence",
+                description="General purpose assistance with persistence",
                 tags=["general"],
             )
         ],
@@ -101,9 +119,13 @@ def main():
     handler = DefaultRequestHandler(agent_executor=executor, task_store=task_store)
     app = A2AStarletteApplication(agent_card=agent_card, http_handler=handler)
 
-    persistence_status = "enabled" if checkpointer else "disabled"
-    print(f"Checkpoint persistence: {persistence_status}")
+    checkpointer_type = type(checkpointer).__name__ if checkpointer else "None"
+    task_store_type = type(task_store).__name__
+    print(f"Environment: {env}")
+    print(f"Checkpointer: {checkpointer_type}")
+    print(f"TaskStore: {task_store_type}")
     print(f"Server running on {host}:{port}...")
+    print("Message sync: enabled (supports Open WebUI retry/delete)")
     uvicorn.run(app.build(), host=host, port=port, log_level="info")
 
 

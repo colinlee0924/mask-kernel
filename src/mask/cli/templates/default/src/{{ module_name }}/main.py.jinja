@@ -1,7 +1,11 @@
-"""A2A Server using native a2a-sdk + MASK helpers (InMemory version).
+"""A2A Server with SQLite persistence (Local Development).
 
-This is the simple version for local development without database dependencies.
-For production with PostgreSQL persistence, use main_persistent.py instead.
+This is the default entry point for local development with:
+- SQLite checkpointer for conversation state persistence
+- InMemoryTaskStore for A2A tasks
+- Message synchronization support for Open WebUI retry/delete
+
+For production with PostgreSQL, use main_persistent.py instead.
 
 Usage:
     python -m {{ module_name }}.main
@@ -19,6 +23,7 @@ from a2a.server.tasks import InMemoryTaskStore
 from a2a.types import AgentCapabilities, AgentCard, AgentSkill
 
 from mask.a2a.helpers import create_a2a_executor
+from mask.checkpoints import create_sqlite_checkpointer
 from mask.observability import setup_openinference_tracing
 
 from {{ module_name }}.agent import create_agent
@@ -29,12 +34,14 @@ load_dotenv(env_path)
 
 
 async def setup_agent():
-    """Async setup for the agent."""
-    return await create_agent()
+    """Async setup for the agent with SQLite checkpointer."""
+    # Use SQLite for local development (enables message sync)
+    checkpointer = create_sqlite_checkpointer("checkpoints.db")
+    return await create_agent(checkpointer=checkpointer), checkpointer
 
 
 def main():
-    """Start the A2A server (InMemory - for local development)."""
+    """Start the A2A server (Local Development with SQLite)."""
     # Setup Phoenix tracing
     setup_openinference_tracing(
         project_name=os.environ.get("PHOENIX_PROJECT_NAME", "{{ project_name }}"),
@@ -42,12 +49,18 @@ def main():
         api_key=os.environ.get("PHOENIX_API_KEY"),
     )
 
-    # Create agent (async)
-    agent = asyncio.run(setup_agent())
+    # Create agent with SQLite checkpointer
+    agent, checkpointer = asyncio.run(setup_agent())
 
     # Create executor using MASK helper
     # stream=True enables real-time streaming for Open WebUI integration
-    executor = create_a2a_executor(agent, server_name="{{ project_name }}", stream=True)
+    # checkpointer enables message sync (retry/delete detection)
+    executor = create_a2a_executor(
+        agent,
+        server_name="{{ project_name }}",
+        stream=True,
+        checkpointer=checkpointer,
+    )
 
     # Configure server
     host = os.environ.get("A2A_HOST", "0.0.0.0")
@@ -56,7 +69,7 @@ def main():
     # Create agent card for service discovery
     agent_card = AgentCard(
         name="{{ project_name }}",
-        description="A MASK-powered agent",
+        description="A MASK-powered agent with SQLite persistence",
         url=f"http://{host}:{port}/",
         version="1.0.0",
         skills=[
@@ -72,7 +85,7 @@ def main():
         defaultOutputModes=["text"],
     )
 
-    # Create request handler (InMemory - no database required)
+    # Create request handler (InMemory task store for local dev)
     handler = DefaultRequestHandler(
         agent_executor=executor,
         task_store=InMemoryTaskStore(),
@@ -84,8 +97,10 @@ def main():
         http_handler=handler,
     )
 
-    print(f"Starting {{ project_name }} on {host}:{port}... (InMemory mode)")
-    print("Note: For production with persistence, use: python -m {{ module_name }}.main_persistent")
+    checkpointer_type = type(checkpointer).__name__ if checkpointer else "None"
+    print(f"Starting {{ project_name }} on {host}:{port}...")
+    print(f"Checkpointer: {checkpointer_type} (enables Open WebUI retry/delete sync)")
+    print("Note: For production with PostgreSQL, use: python -m {{ module_name }}.main_persistent")
     uvicorn.run(app.build(), host=host, port=port, log_level="info")
 
 
