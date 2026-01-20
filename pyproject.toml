@@ -46,6 +46,10 @@ dependencies = [
 redis = ["redis>=5.0"]
 postgresql = ["asyncpg>=0.29.0", "sqlalchemy>=2.0"]
 
+# LangGraph checkpointer backends
+sqlite = ["langgraph-checkpoint-sqlite>=2.0.0"]
+postgres-checkpointer = ["langgraph-checkpoint-postgres>=2.0.0", "psycopg[pool]>=3.0.0"]
+
 # Observability - Langfuse (recommended for multi-tenant production)
 observability = [
     "langfuse>=2.0.0",
@@ -77,7 +81,7 @@ dev = [
 
 # All optional dependencies
 all = [
-    "mask-kernel[redis,postgresql,observability,anthropic,openai,mcp,dev]",
+    "mask-kernel[redis,postgresql,sqlite,postgres-checkpointer,observability,anthropic,openai,mcp,dev]",
 ]
 
 [project.scripts]

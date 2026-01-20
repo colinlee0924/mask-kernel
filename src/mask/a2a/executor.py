@@ -19,11 +19,13 @@ Usage:
     executor = create_a2a_executor(graph, server_name="my-agent")
 """
 
+from __future__ import annotations
+
 import hashlib
 import json
 import logging
 import uuid
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
@@ -42,6 +44,7 @@ if TYPE_CHECKING:
     from langgraph.graph.state import CompiledStateGraph
 
     from mask.a2a.delegation import DelegationToolFactory
+    from mask.a2a.state_sync import StateSynchronizer, SyncResult
     from mask.agent.base_agent import BaseAgent
     from mask.middleware.a2a_streaming import A2AStreamingMiddleware
     from mask.storage.base import SessionStore
@@ -96,13 +99,13 @@ class MaskAgentExecutor(AgentExecutor):
 
     def __init__(
         self,
-        agent: Union["BaseAgent", "CompiledStateGraph"],
+        agent: BaseAgent | CompiledStateGraph,
         stream: bool = True,
         server_name: str = None,
-        checkpointer: Optional["BaseCheckpointSaver"] = None,
-        session_store: Optional["SessionStore"] = None,
-        streaming_middleware: Optional["A2AStreamingMiddleware"] = None,
-        delegation_factory: Optional["DelegationToolFactory"] = None,
+        checkpointer: BaseCheckpointSaver | None = None,
+        session_store: SessionStore | None = None,
+        streaming_middleware: A2AStreamingMiddleware | None = None,
+        delegation_factory: DelegationToolFactory | None = None,
     ) -> None:
         """Initialize executor with agent.
 
@@ -129,11 +132,16 @@ class MaskAgentExecutor(AgentExecutor):
         self.streaming_middleware = streaming_middleware
         self.delegation_factory = delegation_factory
         # Track last checkpoint_id for metadata injection
-        self._last_checkpoint_id: Optional[str] = None
+        self._last_checkpoint_id: str | None = None
         # Detect agent type: CompiledStateGraph has ainvoke but not invoke with session
         self._is_graph = hasattr(agent, "ainvoke") and not hasattr(
             agent, "invoke_with_session"
         )
+        # Initialize StateSynchronizer for message sync (only for graph-based agents)
+        self._synchronizer: StateSynchronizer | None = None
+        if self._is_graph:
+            from mask.a2a.state_sync import StateSynchronizer
+            self._synchronizer = StateSynchronizer(agent, checkpointer)
 
     async def execute(
         self,
@@ -166,6 +174,21 @@ class MaskAgentExecutor(AgentExecutor):
         context_id = self._extract_context_id(context)
         task_id = self._extract_task_id(context)
 
+        # Extract full history for sync detection (Open WebUI sends this)
+        full_history = self._extract_full_history(context)
+
+        # Analyze sync state if we have history and a synchronizer
+        sync_result: SyncResult | None = None
+        if full_history and self._synchronizer and context_id:
+            sync_result = await self._synchronizer.analyze(context_id, full_history)
+            if sync_result:
+                logger.info(
+                    "[SYNC] Thread: %s | Action: %s | Message: %s",
+                    context_id,
+                    sync_result.action,
+                    sync_result.message,
+                )
+
         logger.debug(
             "Executing agent with message: %s... (session: %s, handoff: %s)",
             user_message[:50],
@@ -183,6 +206,7 @@ class MaskAgentExecutor(AgentExecutor):
                 handoff_context,
                 context_id,
                 task_id,
+                sync_result,
             )
         except Exception as e:
             logger.exception("Agent execution failed: %s", e)
@@ -194,10 +218,11 @@ class MaskAgentExecutor(AgentExecutor):
         self,
         message: str,
         event_queue: EventQueue,
-        session_id: Optional[str] = None,
-        handoff_context: Optional[HandoffContext] = None,
-        context_id: Optional[str] = None,
-        task_id: Optional[str] = None,
+        session_id: str | None = None,
+        handoff_context: HandoffContext | None = None,
+        context_id: str | None = None,
+        task_id: str | None = None,
+        sync_result: SyncResult | None = None,
     ) -> None:
         """Execute agent with OpenTelemetry tracing.
 
@@ -205,6 +230,15 @@ class MaskAgentExecutor(AgentExecutor):
         compatible attributes (Phoenix/OpenInference, Langfuse, GenAI).
         This span becomes the primary trace root, replacing the verbose
         A2A SDK span names.
+
+        Args:
+            message: User message to process.
+            event_queue: A2A event queue for sending responses.
+            session_id: Session ID for tracing.
+            handoff_context: Multi-agent handoff context.
+            context_id: A2A context ID (used as thread_id).
+            task_id: A2A task ID for streaming events.
+            sync_result: Result from StateSynchronizer.analyze() for rollback handling.
         """
         # Use server_name for root span (distinguishes from LangGraph agent name)
         # Falls back to agent name if server_name not provided
@@ -218,7 +252,7 @@ class MaskAgentExecutor(AgentExecutor):
             tracer = trace.get_tracer("mask.a2a")
 
             # Build span attributes
-            span_attributes: Dict[str, Any] = {
+            span_attributes: dict[str, Any] = {
                 "openinference.span.kind": "AGENT",
             }
 
@@ -270,6 +304,7 @@ class MaskAgentExecutor(AgentExecutor):
                                 handoff_context,
                                 context_id,
                                 task_id,
+                                sync_result,
                             )
                     except ImportError:
                         response_text = await self._execute_and_capture(
@@ -279,6 +314,7 @@ class MaskAgentExecutor(AgentExecutor):
                             handoff_context,
                             context_id,
                             task_id,
+                            sync_result,
                         )
                 else:
                     response_text = await self._execute_and_capture(
@@ -288,6 +324,7 @@ class MaskAgentExecutor(AgentExecutor):
                         handoff_context,
                         context_id,
                         task_id,
+                        sync_result,
                     )
 
                 # Set output after execution (multi-backend compatible)
@@ -303,6 +340,7 @@ class MaskAgentExecutor(AgentExecutor):
                 handoff_context,
                 context_id,
                 task_id,
+                sync_result,
             )
         except Exception as e:
             logger.warning("Tracing setup failed: %s, executing without tracing", e)
@@ -313,16 +351,18 @@ class MaskAgentExecutor(AgentExecutor):
                 handoff_context,
                 context_id,
                 task_id,
+                sync_result,
             )
 
     async def _execute_and_capture(
         self,
         message: str,
         event_queue: EventQueue,
-        session_id: Optional[str] = None,
-        handoff_context: Optional[HandoffContext] = None,
-        context_id: Optional[str] = None,
-        task_id: Optional[str] = None,
+        session_id: str | None = None,
+        handoff_context: HandoffContext | None = None,
+        context_id: str | None = None,
+        task_id: str | None = None,
+        sync_result: SyncResult | None = None,
     ) -> str:
         """Execute agent and capture the response text.
 
@@ -333,6 +373,7 @@ class MaskAgentExecutor(AgentExecutor):
             handoff_context: Multi-agent handoff context.
             context_id: A2A context ID for streaming events.
             task_id: A2A task ID for streaming events.
+            sync_result: Result from StateSynchronizer.analyze() for rollback handling.
 
         Returns:
             The response text from the agent.
@@ -345,23 +386,36 @@ class MaskAgentExecutor(AgentExecutor):
                 handoff_context,
                 context_id,
                 task_id,
+                sync_result,
             )
         else:
             return await self._execute_non_streaming_capture(
-                message, event_queue, session_id, handoff_context, context_id
+                message, event_queue, session_id, handoff_context, context_id, sync_result
             )
 
     async def _execute_non_streaming_capture(
         self,
         message: str,
         event_queue: EventQueue,
-        session_id: Optional[str] = None,
-        handoff_context: Optional[HandoffContext] = None,
-        context_id: Optional[str] = None,
+        session_id: str | None = None,
+        handoff_context: HandoffContext | None = None,
+        context_id: str | None = None,
+        sync_result: SyncResult | None = None,
     ) -> str:
         """Execute agent without streaming and capture response.
 
         Supports both CompiledStateGraph and BaseAgent.
+
+        Args:
+            message: User message to process.
+            event_queue: A2A event queue for sending responses.
+            session_id: Session ID for tracing.
+            handoff_context: Multi-agent handoff context.
+            context_id: A2A context ID (used as thread_id).
+            sync_result: Result from StateSynchronizer.analyze() for rollback handling.
+
+        Returns:
+            The response text from the agent.
         """
         if self._is_graph:
             # CompiledStateGraph: invoke({"messages": [HumanMessage(...)]})
@@ -369,7 +423,12 @@ class MaskAgentExecutor(AgentExecutor):
 
             # Use context_id as thread_id for multi-turn conversation memory
             thread_id = context_id or str(uuid.uuid4())
-            config = {"configurable": {"thread_id": thread_id}}
+
+            # Build config with sync result (may include checkpoint_id for rollback)
+            if sync_result and self._synchronizer:
+                config = self._synchronizer.get_invoke_config(thread_id, sync_result)
+            else:
+                config = {"configurable": {"thread_id": thread_id}}
 
             result = await self.agent.ainvoke(
                 {"messages": [HumanMessage(content=message)]},
@@ -395,10 +454,11 @@ class MaskAgentExecutor(AgentExecutor):
         self,
         message: str,
         event_queue: EventQueue,
-        session_id: Optional[str] = None,
-        handoff_context: Optional[HandoffContext] = None,
-        context_id: Optional[str] = None,
-        task_id: Optional[str] = None,
+        session_id: str | None = None,
+        handoff_context: HandoffContext | None = None,
+        context_id: str | None = None,
+        task_id: str | None = None,
+        sync_result: SyncResult | None = None,
     ) -> str:
         """Execute agent with real-time streaming via TaskArtifactUpdateEvent.
 
@@ -407,6 +467,18 @@ class MaskAgentExecutor(AgentExecutor):
 
         Supports both CompiledStateGraph and BaseAgent.
         Uses astream_events() for rich event streaming (thinking, tool calls, etc.)
+
+        Args:
+            message: User message to process.
+            event_queue: A2A event queue for sending responses.
+            session_id: Session ID for tracing.
+            handoff_context: Multi-agent handoff context.
+            context_id: A2A context ID (used as thread_id).
+            task_id: A2A task ID for streaming events.
+            sync_result: Result from StateSynchronizer.analyze() for rollback handling.
+
+        Returns:
+            The response text from the agent.
         """
         full_response = ""
 
@@ -417,10 +489,11 @@ class MaskAgentExecutor(AgentExecutor):
         if self._is_graph:
             # CompiledStateGraph: use astream_events for rich streaming
             full_response = await self._execute_rich_streaming(
-                message, event_queue, context_id, task_id
+                message, event_queue, context_id, task_id, sync_result
             )
         else:
             # BaseAgent: use stream() method
+            artifact_id: str | None = None
             async for chunk in self.agent.stream(
                 message, session_id=session_id, handoff_context=handoff_context
             ):
@@ -473,6 +546,7 @@ class MaskAgentExecutor(AgentExecutor):
         event_queue: EventQueue,
         context_id: str,
         task_id: str,
+        sync_result: SyncResult | None = None,
     ) -> str:
         """Execute with rich streaming using astream_events().
 
@@ -486,6 +560,16 @@ class MaskAgentExecutor(AgentExecutor):
 
         If streaming_middleware is configured, its event_queue is set to enable
         real-time event propagation from middleware hooks.
+
+        Args:
+            message: User message to process.
+            event_queue: A2A event queue for sending responses.
+            context_id: A2A context ID (used as thread_id).
+            task_id: A2A task ID for streaming events.
+            sync_result: Result from StateSynchronizer.analyze() for rollback handling.
+
+        Returns:
+            The response text from the agent.
         """
         from langchain_core.messages import HumanMessage
 
@@ -504,15 +588,20 @@ class MaskAgentExecutor(AgentExecutor):
 
         full_response = ""
         thread_id = context_id or str(uuid.uuid4())
-        config = {"configurable": {"thread_id": thread_id}}
+
+        # Build config with sync result (may include checkpoint_id for rollback)
+        if sync_result and self._synchronizer:
+            config = self._synchronizer.get_invoke_config(thread_id, sync_result)
+        else:
+            config = {"configurable": {"thread_id": thread_id}}
 
         # Artifact IDs for different event types (reused for appending)
-        response_artifact_id: Optional[str] = None
-        thinking_artifact_id: Optional[str] = None
-        current_tool_artifact_id: Optional[str] = None
+        response_artifact_id: str | None = None
+        thinking_artifact_id: str | None = None
+        current_tool_artifact_id: str | None = None
 
         # Track tool calls for proper result matching
-        active_tool_calls: Dict[str, str] = {}  # run_id -> tool_name
+        active_tool_calls: dict[str, str] = {}  # run_id -> tool_name
 
         async for event in self.agent.astream_events(
             {"messages": [HumanMessage(content=message)]},
@@ -777,7 +866,7 @@ class MaskAgentExecutor(AgentExecutor):
 
         return ""
 
-    def _extract_session_id(self, context: RequestContext) -> Optional[str]:
+    def _extract_session_id(self, context: RequestContext) -> str | None:
         """Extract session ID from A2A request context.
 
         A2A uses context_id (contextId in JSON) as the session/conversation identifier.
@@ -810,7 +899,7 @@ class MaskAgentExecutor(AgentExecutor):
         logger.warning("[SESSION] No session_id found in context!")
         return None
 
-    def _extract_context_id(self, context: RequestContext) -> Optional[str]:
+    def _extract_context_id(self, context: RequestContext) -> str | None:
         """Extract context ID from A2A request context for streaming events.
 
         Args:
@@ -829,7 +918,7 @@ class MaskAgentExecutor(AgentExecutor):
 
         return str(uuid.uuid4())
 
-    def _extract_task_id(self, context: RequestContext) -> Optional[str]:
+    def _extract_task_id(self, context: RequestContext) -> str | None:
         """Extract task ID from A2A request context for streaming events.
 
         Args:
@@ -849,7 +938,7 @@ class MaskAgentExecutor(AgentExecutor):
 
     def _extract_handoff_context(
         self, context: RequestContext
-    ) -> Optional[HandoffContext]:
+    ) -> HandoffContext | None:
         """Extract handoff context from A2A request context.
 
         Handoff context is passed via A2A message metadata for multi-agent
@@ -866,7 +955,7 @@ class MaskAgentExecutor(AgentExecutor):
         """
         # Check context.metadata first (A2A SDK property from MessageSendParams)
         # This is where metadata is passed in message/send params
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: dict[str, Any] | None = None
 
         # Primary: context.metadata (from MessageSendParams.metadata)
         if hasattr(context, "metadata") and context.metadata:
@@ -920,7 +1009,7 @@ class MaskAgentExecutor(AgentExecutor):
 
     def _extract_full_history(
         self, context: RequestContext
-    ) -> Optional[List[Dict[str, Any]]]:
+    ) -> list[dict[str, Any]] | None:
         """Extract full message history from A2A request configuration.
 
         The frontend (Open WebUI via Pipe Function) sends complete message
@@ -938,7 +1027,7 @@ class MaskAgentExecutor(AgentExecutor):
             return None
 
         # Check message metadata for fullHistory (from A2A configuration)
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: dict[str, Any] | None = None
         if hasattr(message, "metadata") and message.metadata:
             metadata = message.metadata
         elif hasattr(message, "root") and hasattr(message.root, "metadata"):
@@ -957,8 +1046,8 @@ class MaskAgentExecutor(AgentExecutor):
         return None
 
     def _extract_metadata_from_messages(
-        self, messages: List[Dict[str, Any]]
-    ) -> Dict[str, Any]:
+        self, messages: list[dict[str, Any]]
+    ) -> dict[str, Any]:
         """Extract LangGraph/A2A metadata from frontend messages.
 
         Extracts checkpoint_id, thread_id, and task_id from message metadata
@@ -1010,10 +1099,10 @@ class MaskAgentExecutor(AgentExecutor):
     def _inject_metadata_to_response(
         self,
         response_text: str,
-        checkpoint_id: Optional[str] = None,
-        thread_id: Optional[str] = None,
-        task_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        checkpoint_id: str | None = None,
+        thread_id: str | None = None,
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
         """Create response with injected metadata for frontend tracking.
 
         Injects LangGraph checkpoint_id, thread_id, and A2A task_id into
@@ -1042,7 +1131,7 @@ class MaskAgentExecutor(AgentExecutor):
             "metadata": metadata if metadata else None,
         }
 
-    def _compute_messages_hash(self, messages: List[Dict[str, Any]]) -> str:
+    def _compute_messages_hash(self, messages: list[dict[str, Any]]) -> str:
         """Compute hash of message contents for change detection.
 
         Args:
@@ -1063,8 +1152,8 @@ class MaskAgentExecutor(AgentExecutor):
 
     def _detect_regenerate(
         self,
-        frontend_messages: List[Dict[str, Any]],
-        last_checkpoint_id: Optional[str],
+        frontend_messages: list[dict[str, Any]],
+        last_checkpoint_id: str | None,
     ) -> bool:
         """Detect if this is a regenerate (retry) request.
 
@@ -1098,9 +1187,9 @@ class MaskAgentExecutor(AgentExecutor):
 
     def _detect_deletion(
         self,
-        frontend_messages: List[Dict[str, Any]],
-        backend_messages: List[Dict[str, Any]],
-    ) -> List[str]:
+        frontend_messages: list[dict[str, Any]],
+        backend_messages: list[dict[str, Any]],
+    ) -> list[str]:
         """Detect deleted messages by comparing frontend and backend.
 
         Args:
@@ -1135,7 +1224,7 @@ class MaskAgentExecutor(AgentExecutor):
 
     async def _get_checkpoint_messages(
         self, thread_id: str
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Get messages from LangGraph checkpoint.
 
         Args:
@@ -1170,9 +1259,9 @@ class MaskAgentExecutor(AgentExecutor):
     async def _sync_to_checkpoint(
         self,
         thread_id: str,
-        frontend_messages: List[Dict[str, Any]],
-        parent_checkpoint_id: Optional[str] = None,
-    ) -> Optional[str]:
+        frontend_messages: list[dict[str, Any]],
+        parent_checkpoint_id: str | None = None,
+    ) -> str | None:
         """Sync frontend messages to LangGraph checkpoint.
 
         Uses update_state to reshape checkpoint to match frontend state.
