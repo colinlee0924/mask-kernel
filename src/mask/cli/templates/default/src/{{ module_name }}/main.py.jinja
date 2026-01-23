@@ -26,7 +26,7 @@ from mask.a2a.helpers import create_a2a_executor
 from mask.checkpoints import create_sqlite_checkpointer
 from mask.observability import setup_openinference_tracing
 
-from {{ module_name }}.agent import create_agent
+from {{ module_name }}.agent import create_agent, streaming_middleware
 
 # Load .env file from project root
 env_path = Path(__file__).parent.parent.parent / ".env"
@@ -55,11 +55,13 @@ def main():
     # Create executor using MASK helper
     # stream=True enables real-time streaming for Open WebUI integration
     # checkpointer enables message sync (retry/delete detection)
+    # streaming_middleware enables tool call and thinking status updates
     executor = create_a2a_executor(
         agent,
         server_name="{{ project_name }}",
         stream=True,
         checkpointer=checkpointer,
+        streaming_middleware=streaming_middleware,
     )
 
     # Configure server

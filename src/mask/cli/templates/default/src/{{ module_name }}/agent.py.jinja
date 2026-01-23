@@ -1,4 +1,7 @@
-"""Agent configuration using LangChain create_agent + MASK SkillMiddleware."""
+"""Agent configuration using LangChain create_agent + MASK SkillMiddleware.
+
+Includes A2AStreamingMiddleware for real-time status updates in Open WebUI.
+"""
 
 from pathlib import Path
 from typing import Optional
@@ -9,10 +12,15 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from mask.core import SkillRegistry
 from mask.middleware import SkillMiddleware
+from mask.middleware.a2a_streaming import A2AStreamingMiddleware
 from mask.models import LLMFactory, ModelTier
 from mask.mcp import load_mcp_tools_from_config
 
 from {{ module_name }}.tools import get_custom_tools
+
+# Create streaming middleware instance at module level
+# This allows main.py to import and pass it to the executor
+streaming_middleware = A2AStreamingMiddleware(agent_name="{{ project_name }}")
 
 
 def load_system_prompt() -> str:
@@ -74,10 +82,13 @@ async def create_agent(
 
     # Create agent using native LangChain API
     # Returns CompiledStateGraph - pass directly to create_a2a_executor()
+    # middleware includes:
+    # - SkillMiddleware: Progressive Disclosure for skills
+    # - A2AStreamingMiddleware: Real-time status updates (tool calls, thinking)
     return langchain_create_agent(
         model=model,
         tools=tools,
         system_prompt=load_system_prompt(),
-        middleware=[middleware],
+        middleware=[middleware, streaming_middleware],
         checkpointer=checkpointer,
     )

@@ -31,7 +31,7 @@ from mask.checkpoints import get_async_checkpointer, setup_postgres_tables
 from mask.a2a import create_a2a_executor, create_database_task_store
 from mask.observability import setup_openinference_tracing
 
-from {{ module_name }}.agent import create_agent
+from {{ module_name }}.agent import create_agent, streaming_middleware
 
 # Load .env file from project root
 env_path = Path(__file__).parent.parent.parent / ".env"
@@ -90,11 +90,13 @@ def main():
         task_store = InMemoryTaskStore()
 
     # Create executor with checkpointer for message sync support
+    # streaming_middleware enables tool call and thinking status updates
     executor = create_a2a_executor(
         agent,
         server_name="{{ project_name }}",
         stream=True,
         checkpointer=checkpointer,
+        streaming_middleware=streaming_middleware,
     )
 
     # Build A2A server using native SDK
