@@ -44,7 +44,12 @@ dependencies = [
 [project.optional-dependencies]
 # Storage backends
 redis = ["redis>=5.0"]
-postgresql = ["asyncpg>=0.29.0", "sqlalchemy>=2.0"]
+postgresql = [
+    "asyncpg>=0.29.0",
+    "sqlalchemy>=2.0",
+    "langgraph-checkpoint-postgres>=2.0.0",
+    "psycopg[binary,pool]>=3.1.0",
+]
 
 # LangGraph checkpointer backends
 sqlite = ["langgraph-checkpoint-sqlite>=2.0.0"]
