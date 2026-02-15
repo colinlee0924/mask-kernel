@@ -12,6 +12,11 @@ The middleware uses request.override(tools=...) to dynamically change
 which tools the model sees on each invocation. This enables true Progressive
 Disclosure within a single invoke() call.
 
+Progressive Disclosure Levels:
+- Level 1 (Metadata): Skill name + description injected into system prompt
+- Level 2 (Instructions): Full SKILL.md loaded when loader tool is called
+- Level 3 (Resources): Agent uses read_file to access scripts/, references/, assets/
+
 When a loader tool is called:
 1. It returns a Command with skills_loaded update
 2. The state is updated by LangGraph
@@ -50,12 +55,17 @@ logger = logging.getLogger(__name__)
 def build_skills_system_prompt(
     registry: SkillRegistry,
     active_skills: List[str],
+    include_paths: bool = True,
 ) -> str:
     """Build system prompt section describing available skills.
+
+    Implements Progressive Disclosure Level 1 by injecting skill metadata
+    (name, description, path) into the system prompt.
 
     Args:
         registry: The skill registry containing available skills.
         active_skills: List of currently active skill names.
+        include_paths: Whether to include skill paths for Level 3 access.
 
     Returns:
         System prompt section describing skills.
@@ -64,6 +74,8 @@ def build_skills_system_prompt(
 
     # List available skills
     skills_summary = registry.get_skills_summary()
+    all_skills = registry.get_all_skills()
+
     if skills_summary:
         lines.append("## Available Skills")
         lines.append("")
@@ -79,7 +91,38 @@ def build_skills_system_prompt(
                 status = "ACTIVE" if name in active_skills else "available"
                 lines.append(f"- **{name}** ({status}): {desc}")
 
+                # Include path information for Level 3 access
+                if include_paths:
+                    # Find the skill to get its directory
+                    skill = next(
+                        (s for s in all_skills if s.metadata.name == name),
+                        None,
+                    )
+                    if skill and skill.skill_dir:
+                        skill_dir = skill.skill_dir
+                        lines.append(f"  - Path: `{skill_dir / 'SKILL.md'}`")
+
+                        # List available resource subdirectories
+                        subdirs = []
+                        for subdir in ["scripts", "references", "assets"]:
+                            subdir_path = skill_dir / subdir
+                            if subdir_path.exists() and subdir_path.is_dir():
+                                subdirs.append(f"`{subdir}/`")
+                        if subdirs:
+                            lines.append(f"  - Resources: {', '.join(subdirs)}")
+
         lines.append("")
+
+        # Add Level 3 usage instructions if paths are included
+        if include_paths:
+            lines.append("**How to Access Skill Resources (Progressive Disclosure):**")
+            lines.append("")
+            lines.append("1. **Activate a skill**: Call `use_<skill_name>()` to load instructions")
+            lines.append("2. **Read additional resources**: Use `read_file(path)` for detailed docs in:")
+            lines.append("   - `scripts/`: Executable Python or shell scripts")
+            lines.append("   - `references/`: Documentation, API specs, examples")
+            lines.append("   - `assets/`: Templates, configurations, data files")
+            lines.append("")
 
     # Include active skill instructions
     if active_skills:
@@ -197,6 +240,7 @@ class SkillMiddleware(AgentMiddleware if HAS_AGENT_MIDDLEWARE else object):
         self,
         registry: SkillRegistry,
         include_skill_instructions: bool = True,
+        include_skill_paths: bool = True,
         verbose: bool = False,
         additional_tools: Optional[List[BaseTool]] = None,
     ) -> None:
@@ -206,6 +250,8 @@ class SkillMiddleware(AgentMiddleware if HAS_AGENT_MIDDLEWARE else object):
             registry: Skill registry for tool management.
             include_skill_instructions: Whether to include skill instructions
                 in the system prompt when skills are active.
+            include_skill_paths: Whether to include skill paths in system prompt
+                for Level 3 progressive disclosure (read_file access).
             verbose: Whether to log tool filtering details.
             additional_tools: Non-skill tools to always include.
         """
@@ -213,6 +259,7 @@ class SkillMiddleware(AgentMiddleware if HAS_AGENT_MIDDLEWARE else object):
             super().__init__()
         self.registry = registry
         self.include_skill_instructions = include_skill_instructions
+        self.include_skill_paths = include_skill_paths
         self.verbose = verbose
         self.additional_tools = additional_tools or []
 
@@ -327,10 +374,11 @@ class SkillMiddleware(AgentMiddleware if HAS_AGENT_MIDDLEWARE else object):
 
         active_skills = state.get("skills_loaded", [])
 
-        # Build skills prompt
+        # Build skills prompt with optional path information
         skills_prompt = build_skills_system_prompt(
             self.registry,
             active_skills,
+            include_paths=self.include_skill_paths,
         )
 
         # Inject into messages
